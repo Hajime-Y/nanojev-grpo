@@ -1,5 +1,7 @@
 """CPU-only contract tests; CUDA and ViZDoom are not needed."""
 import copy
+from collections import Counter
+from contextlib import contextmanager, ExitStack
 import importlib.util
 import json
 import math
@@ -11,11 +13,12 @@ import tempfile
 import time
 from types import SimpleNamespace
 import unittest
-from unittest.mock import patch
+from unittest.mock import MagicMock, patch
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 import pp_rl as rl
 from pp_envpool import EnvPool
+from pp_tree import split_tree, tree_forward, tree_tokens
 from predict_toy_decisions import local_checkpoint_files, prepare_examples
 from unified_game_pipeline import POLICY_QUESTION, behavior_distribution, policy_request
 
@@ -132,6 +135,109 @@ def tiny_model():
     return TinyModel()
 
 
+def causal_model(set_head="none"):
+    """Small double-precision transformer with an independent, unpadded path reference."""
+    import torch
+    from torch import nn
+
+    class Backbone(nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.tokens = nn.Embedding(258, 12)
+            self.positions = nn.Embedding(1024, 12)
+            self.qkv = nn.ModuleList([nn.Linear(12, 36) for _ in range(2)])
+            self.ff = nn.ModuleList([nn.Sequential(nn.Linear(12, 20), nn.Tanh(), nn.Linear(20, 12))
+                                     for _ in range(2)])
+
+        def forward(self, input_ids, attention_mask, position_ids=None, use_cache=False):
+            width = input_ids.shape[1]
+            if position_ids is None:
+                position_ids = torch.arange(width)[None]
+            h = self.tokens(input_ids) + self.positions(position_ids)
+            if attention_mask.ndim == 2:
+                allowed = torch.ones(width, width, dtype=torch.bool).tril()[None] & attention_mask[:, None, :]
+            else:
+                allowed = attention_mask[:, 0]
+            for qkv, ff in zip(self.qkv, self.ff):
+                q, k, v = qkv(h).chunk(3, dim=-1)
+                weights = (q @ k.transpose(-1, -2) / math.sqrt(12)).masked_fill(~allowed, -torch.inf).softmax(-1)
+                h = h + weights @ v
+                h = h + ff(h)
+            return SimpleNamespace(last_hidden_state=h)
+
+    class Model(nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.backbone = Backbone()
+            self.norm, self.scalar = nn.LayerNorm(12), nn.Linear(12, 1)
+            self.set_head = set_head
+            if set_head == "attention":
+                self.set_project = nn.Linear(13, 12)
+                self.set_attention = nn.MultiheadAttention(12, 3, batch_first=True, dropout=0)
+                self.set_output = nn.Linear(12, 1)
+
+        def forward(self, examples, pad_token):
+            results = []
+            for ex in examples:
+                ends = []
+                for leaf in ex["leaf_tokens"]:
+                    ids = torch.tensor([leaf])
+                    ends.append(self.backbone(ids, torch.ones_like(ids, dtype=torch.bool)).last_hidden_state[0, -1])
+                h = self.norm(torch.stack(ends))
+                z = self.scalar(h).squeeze(-1).float()
+                if ex["type"] == "choice" and self.set_head == "attention":
+                    u = self.set_project(torch.cat([h, h.new_full((len(h), 1), math.log(len(h)))], dim=-1))[None]
+                    mixed, _ = self.set_attention(u, u, u, need_weights=False)
+                    z = z + self.set_output(torch.tanh(u + mixed))[0, :, 0].float()
+                if ex["type"] == "boolean":
+                    z = torch.stack([z[0] * 0, z[0]])
+                results.append(z)
+            logits = nn.utils.rnn.pad_sequence(results, batch_first=True, padding_value=-1e9)
+            valid = torch.arange(logits.shape[1])[None] < torch.tensor([len(row) for row in results])[:, None]
+            return logits, valid
+
+    torch.manual_seed(123)
+    return Model().double()
+
+
+@contextmanager
+def fake_training(root, command):
+    source, out = root / "init", root / "out"
+    source.mkdir()
+    (source / "config.json").write_text("{}")
+    (source / "best.safetensors").write_bytes(b"initial")
+    for name in ("tokenizer", "backbone_config"):
+        (source / name).mkdir()
+    args = rl.parse_args([command, "--init-checkpoint", str(source), "--cases", "cases",
+                          "--output-dir", str(out), "--save-every", "2", "--eval-every", "2",
+                          "--steps" if command == "grpo" else "--updates", "5"])
+    torch = MagicMock(__version__="fake")
+    torch.cuda.get_device_name.return_value = "fake GPU"
+    torch.cuda.max_memory_allocated.return_value = 0
+    torch.save.side_effect = lambda state, path: Path(path).write_bytes(b"optimizer")
+    safetensors = SimpleNamespace(save_file=lambda state, path: Path(path).write_bytes(b"weights"))
+    model = MagicMock()
+    model.state_dict.return_value = {}
+    runtime = SimpleNamespace(model=model)
+    scorer = SimpleNamespace(model=model, tokenizer=FakeTokenizer(), tokens=Counter())
+    row = policy_row()
+    items = [dict(request={key: row[key] for key in ("id", "state", "questions")}, action="shoot")]
+    stats = dict(mean_loss=.5, gradient_norm_before_clip=[1.0], tokens={})
+    with ExitStack() as stack:
+        stack.enter_context(patch.dict(sys.modules, {"torch": torch, "safetensors": SimpleNamespace(torch=safetensors),
+                                                      "safetensors.torch": safetensors}))
+        for name, value in (("load", runtime), ("Scorer", scorer), ("select_cases", [case()]),
+                            ("sft_rows", items), ("grpo_collection", (items, {}))):
+            stack.enter_context(patch.object(rl, name, return_value=value))
+        stack.enter_context(patch.object(rl, "EnvPool"))
+        stack.enter_context(patch.object(rl, "game_eval"))
+        stack.enter_context(patch.object(rl, "heartbeat"))
+        stack.enter_context(patch("builtins.print"))
+        saves = stack.enter_context(patch.object(rl, "checkpoint", wraps=rl.checkpoint))
+        update = stack.enter_context(patch.object(rl, "update_model", return_value=stats))
+        yield args, saves, update
+
+
 class PoolTests(unittest.TestCase):
     def test_workers_step_drain_and_reuse(self):
         work = jobs(6)
@@ -200,6 +306,17 @@ class PoolTests(unittest.TestCase):
 
 
 class EpisodeTests(unittest.TestCase):
+    def test_chunked_evaluation_matches_unchunked(self):
+        with EnvPool(2, factory=FakeEnv) as pool:
+            for mode in ("greedy", "sample"):
+                expected = rl.eval_episodes(FakeScorer(), pool, jobs(7), mode, 100,
+                                            temperature=.7, epsilon=.3, seed=42)
+                with patch.object(pool, "reset", wraps=pool.reset) as reset:
+                    actual = rl.eval_episodes(FakeScorer(), pool, jobs(7), mode, 3,
+                                              temperature=.7, epsilon=.3, seed=42)
+                self.assertEqual(actual, expected)
+                self.assertEqual([len(call.args[0]) for call in reset.call_args_list], [3, 3, 1])
+
     def test_delayed_ammo_drain_success_and_prompt_identity(self):
         scorer, progress = FakeScorer(), []
         with EnvPool(2, factory=FakeEnv) as pool:
@@ -273,18 +390,59 @@ class LogicTests(unittest.TestCase):
     def test_token_packing(self):
         examples = [dict(id=str(i), leaf_tokens=[[1] * length] * count)
                     for i, (length, count) in enumerate([(7, 4), (3, 2), (9, 4), (4, 3)])]
-        batches = rl.pack(examples, 60)
+        batches = rl.pack(examples, 60, "paths")
         self.assertEqual(sorted(i for batch in batches for i in batch), list(range(4)))
         for batch in batches:
             self.assertLessEqual(sum(len(examples[i]["leaf_tokens"]) for i in batch) *
                                  max(len(leaf) for i in batch for leaf in examples[i]["leaf_tokens"]), 60)
-        counts = rl.token_counts(examples, batches)
+        counts = rl.token_counts(examples, batches, "paths")
         self.assertEqual(counts["leaf_paths"], 13)
         self.assertEqual(counts["tokens"], 82)
         self.assertGreaterEqual(counts["padded_tokens"], counts["tokens"])
         self.assertEqual(rl.pack([], 60), [])
         with self.assertRaisesRegex(ValueError, "budget"):
-            rl.pack(examples, 35)
+            rl.pack(examples, 35, "paths")
+
+    def test_tree_structure(self):
+        leaves = [[1, 2, 3], [1, 2, 3, 4], [1, 2, 8, 9]]
+        self.assertEqual(split_tree(leaves), ([1, 2], [[3], [3, 4], [8, 9]]))
+        self.assertEqual(tree_tokens(dict(leaf_tokens=leaves)),
+                         ([1, 2, 3, 3, 4, 8, 9], [0, 1, 2, 2, 3, 2, 3],
+                          [0, 0, 1, 2, 2, 3, 3], [2, 4, 6]))
+        self.assertEqual(tree_tokens(dict(leaf_tokens=[[4, 5, 6]])),
+                         ([4, 5, 6], [0, 1, 2], [0, 0, 1], [2]))
+        self.assertEqual(tree_tokens(dict(leaf_tokens=[[1], [1]])),
+                         ([1, 1], [0, 0], [1, 2], [0, 1]))
+        self.assertEqual(split_tree([[1, 2], [3, 4]]), ([], [[1, 2], [3, 4]]))
+
+    def test_tree_token_packing(self):
+        examples = [dict(id=str(i), leaf_tokens=leaves) for i, leaves in enumerate([
+            [[1, 2, 3], [1, 2, 4]], [[1, 2, 3, 4, 5]], [[1, 3], [2, 4]],
+            [[1, 2, 3, 4], [1, 2, 3, 5], [1, 2, 3, 6]]])]
+        batches = rl.pack(examples, 10, "tree")
+        self.assertEqual(batches, [[0, 2], [1], [3]])
+        for batch in batches:
+            self.assertLessEqual(len(batch) * max(len(tree_tokens(examples[i])[0]) for i in batch), 10)
+        self.assertEqual(rl.token_counts(examples, batches, "tree"),
+                         dict(forward_calls=3, questions=4, leaf_paths=8, tokens=19, padded_tokens=19))
+        self.assertEqual(rl.token_counts(examples[:2], [[0, 1]], "tree")["padded_tokens"], 10)
+        self.assertEqual(rl.pack(examples, 10), batches)
+        self.assertEqual(rl.pack([], 10), [])
+        with self.assertRaisesRegex(ValueError, "budget"):
+            rl.pack(examples, 5, "tree")
+
+    def test_forward_cli_defaults_and_saved_args(self):
+        for command, extra in (("eval", ["--checkpoint", "init", "--output", "out"]),
+                               ("grpo", ["--init-checkpoint", "init", "--output-dir", "out"]),
+                               ("sft", ["--init-checkpoint", "init", "--output-dir", "out"])):
+            argv = [command, "--cases", "cases"] + extra
+            args = rl.parse_args(argv)
+            self.assertEqual(args.forward, "tree")
+            self.assertEqual(args.max_forward_tokens, 140000)
+            self.assertEqual(args.max_concurrent, 256)
+            if command != "eval":
+                self.assertEqual(args.max_microbatch_tokens, 34000)
+            self.assertEqual(rl.saved_args(rl.parse_args(argv + ["--forward", "paths"]))["forward"], "paths")
 
     def test_schedules(self):
         cases = list(range(11))
@@ -337,6 +495,71 @@ class LogicTests(unittest.TestCase):
 
 
 class FileTests(unittest.TestCase):
+    def test_game_eval_chunks_jobs(self):
+        with tempfile.TemporaryDirectory() as temp:
+            args = rl.parse_args(["sft", "--init-checkpoint", "init", "--cases", "cases",
+                                  "--output-dir", temp, "--max-concurrent", "2"])
+            with EnvPool(1, factory=FakeEnv) as pool, patch.object(rl, "heartbeat"), \
+                    patch.object(rl, "run_episodes", wraps=rl.run_episodes) as run:
+                rl.game_eval(FakeScorer(), pool, [case(i) for i in range(5)], args, 0)
+            self.assertEqual([len(call.args[2]) for call in run.call_args_list], [2, 2, 1, 2, 2, 1])
+            records = rl.read_rows(Path(temp) / "eval.jsonl")
+            self.assertEqual([record["episodes"] for record in records], [5, 5])
+            self.assertTrue(all(record["forward"] == "tree" for record in records))
+
+    def test_training_save_cadence_and_config(self):
+        for command, expected in (("sft", [0, 2, 4, 5]), ("grpo", [0, 1, 2, 3, 4, 5])):
+            with self.subTest(command=command), tempfile.TemporaryDirectory() as temp:
+                with fake_training(Path(temp), command) as (args, saves, _):
+                    args.forward = "paths"
+                    rl.train(args)
+                    last = [call.args[2]["completed_step"] for call in saves.call_args_list
+                            if call.args[0].name == "last"]
+                    self.assertEqual(last, expected)
+                    snapshots = [call.args[2]["completed_step"] for call in saves.call_args_list
+                                 if call.args[0].name != "last"]
+                    self.assertEqual(snapshots, [2, 4, 5])
+                    config = json.loads((Path(args.output_dir) / "config.json").read_text())
+                    self.assertEqual(config["args"]["forward"], "paths")
+                    state = json.loads((Path(args.output_dir) / "ckpt/last/state.json").read_text())
+                    self.assertEqual(state["completed_step"], 5)
+
+    def test_sft_resume_replays_unsaved_updates(self):
+        with tempfile.TemporaryDirectory() as temp, fake_training(Path(temp), "sft") as (args, saves, update):
+            stats = update.return_value
+            update.side_effect = [stats, stats, stats, RuntimeError("interrupted")]
+            with self.assertRaisesRegex(RuntimeError, "interrupted"):
+                rl.train(args)
+            out = Path(args.output_dir)
+            self.assertEqual(rl.resume_state(out, args)[1]["completed_step"], 2)
+            self.assertEqual([row["update"] for row in rl.read_rows(out / "updates.jsonl")], [1, 2, 3])
+            args.resume = True
+            update.side_effect = None
+            update.reset_mock()
+            saves.reset_mock()
+            rl.train(args)
+            self.assertEqual([call.args[4] for call in update.call_args_list], [3, 4, 5])
+            self.assertEqual([row["update"] for row in rl.read_rows(out / "updates.jsonl")], [1, 2, 3, 4, 5])
+            self.assertEqual([call.args[2]["completed_step"] for call in saves.call_args_list
+                              if call.args[0].name == "last"], [4, 5])
+
+    def test_forward_check_row_selection(self):
+        with tempfile.TemporaryDirectory() as temp:
+            path = Path(temp) / "dev.jsonl"
+            rows = [policy_row(str(i)) for i in range(30)]
+            rows[0]["metadata"]["record_role"] = "critic"
+            for row in rows[5:]:
+                row["metadata"]["spec"]["scenario"] = "basic"
+            write_rows(path, rows)
+            selected = rl.forward_check_rows(path, 3)
+            self.assertEqual([row["id"] for row in selected], ["1", "2", "3"] + list(map(str, range(5, 21))))
+            self.assertEqual(set(selected[0]), {"id", "state", "questions"})
+            args = rl.parse_args(["check-forward", "--checkpoint", "init", "--data", temp])
+            self.assertEqual((args.count, args.precision), (64, "bf16"))
+            with patch.object(rl, "check_forward", return_value=False), self.assertRaises(SystemExit) as error:
+                rl.main(["check-forward", "--checkpoint", "init", "--data", temp])
+            self.assertEqual(error.exception.code, 1)
+
     def test_checkpoint_layout_resume_and_recovery(self):
         with tempfile.TemporaryDirectory() as temp:
             root = Path(temp)
@@ -421,24 +644,95 @@ class FileTests(unittest.TestCase):
             root = Path(temp)
             write_rows(root / "cases.jsonl", [case(0, split="test"), case(1, split="train")])
             args = rl.parse_args(["eval", "--checkpoint", "fake", "--cases", str(root / "cases.jsonl"),
-                                  "--output", str(root / "eval.jsonl"), "--workers", "1"])
+                                  "--output", str(root / "eval.jsonl"), "--workers", "1",
+                                  "--rollouts", "3", "--max-concurrent", "2"])
             with patch.object(rl, "load"), patch.object(rl, "Scorer", return_value=FakeScorer()), \
                     patch.object(rl, "EnvPool", side_effect=lambda workers: EnvPool(workers, factory=FakeEnv)), \
-                    patch("builtins.print"):
+                    patch("builtins.print"), patch.object(rl, "run_episodes", wraps=rl.run_episodes) as run:
                 rl.run_eval(args)
+            self.assertEqual([len(call.args[2]) for call in run.call_args_list], [2, 1])
             episodes = rl.read_rows(root / "eval.jsonl")
-            self.assertEqual(len(episodes), 1)
+            self.assertEqual(len(episodes), 3)
             self.assertNotIn("state", episodes[0]["decisions"][0])
             self.assertIn("probs", episodes[0]["decisions"][0])
+            self.assertEqual({key: episodes[0][key] for key in ("model_decisions", "fire_decision", "fired", "outcome")},
+                             dict(model_decisions=2, fire_decision=0, fired=True, outcome="hit"))
             summary = json.loads((root / "eval.summary.json").read_text())
             self.assertEqual(summary["success_rate"], 1)
             self.assertEqual(summary["successful_case_ids"], ["case-0"])
+            self.assertEqual({key: summary[key] for key in ("forward", "max_forward_tokens", "rollouts", "epsilon",
+                                                           "temperature", "seed", "cases")},
+                             dict(forward="tree", max_forward_tokens=140000, rollouts=3, epsilon=0.0,
+                                  temperature=1.0, seed=17, cases=str((root / "cases.jsonl").resolve())))
             with self.assertRaisesRegex(ValueError, "exists"):
                 rl.run_eval(args)
 
 
 @unittest.skipUnless(HAS_TORCH, "torch is not installed")
 class TorchTests(unittest.TestCase):
+    def test_tree_selected_for_scoring_and_updates(self):
+        import torch
+        model = causal_model()
+        runtime = SimpleNamespace(model=model, tokenizer=FakeTokenizer(), limit=8192, precision="fp32")
+        row = policy_row()
+        request = {key: row[key] for key in ("id", "state", "questions")}
+        examples = rl.prepare_items([dict(request=request, action="shoot")], runtime.tokenizer, runtime.limit)
+        budget = len(tree_tokens(examples[0])[0])
+        scorer = rl.Scorer(runtime, budget)
+        with patch.object(rl, "tree_forward", wraps=tree_forward) as forward:
+            outputs = scorer([request])
+            self.assertEqual(forward.call_count, 1)
+            self.assertEqual(scorer.tokens["padded_tokens"], budget)
+            expected = model(examples, runtime.tokenizer.pad_token_id)[0][0].log_softmax(-1)
+            torch.testing.assert_close(torch.tensor(outputs[0][1]), expected, atol=1e-5, rtol=0)
+            before = model.scalar.weight.detach().clone()
+            args = SimpleNamespace(forward="tree", max_microbatch_tokens=budget, output_dir="unused",
+                                   precision="fp32", grad_clip=100)
+            with patch.object(rl, "heartbeat"):
+                stats = rl.update_model(scorer, torch.optim.SGD(model.parameters(), lr=.01), examples, args, 1, False)
+            self.assertEqual(forward.call_count, 2)
+            self.assertEqual(stats["tokens"]["padded_tokens"], budget)
+            self.assertFalse(torch.equal(before, model.scalar.weight))
+
+    def test_tree_matches_causal_paths(self):
+        import torch
+        examples = [dict(type=typ, candidate_ids=list(range(count)), leaf_tokens=leaves)
+                    for typ, count, leaves in [
+                        ("choice", 3, [[1, 2, 3], [1, 2, 4, 5], [1, 2, 6]]),
+                        ("choice", 2, [[7], [8, 9]]),
+                        ("score", 3, [[10, 11], [10, 11, 12], [10, 11]]),
+                        ("boolean", 2, [[13, 14, 15, 16]]),
+                        ("choice", 1, [[17, 18, 19]])]]
+        for head in ("none", "attention"):
+            model = causal_model(head).eval()
+            for group in (examples, examples[2:4], examples[3:4], examples[-1:]):
+                with self.subTest(head=head, types=[ex["type"] for ex in group]), torch.inference_mode():
+                    expected, valid = model(group, 0)
+                    actual, tree_valid = tree_forward(model, group, 0)
+                    self.assertEqual(model.scalar.weight.dtype, torch.float64)
+                    self.assertTrue(torch.equal(tree_valid, valid))
+                    torch.testing.assert_close(actual, expected, atol=1e-5, rtol=0)
+
+    def test_check_forward_metrics_and_failure(self):
+        with tempfile.TemporaryDirectory() as temp:
+            write_rows(Path(temp) / "dev.jsonl", [policy_row()])
+            runtime = SimpleNamespace(model=causal_model(), tokenizer=FakeTokenizer())
+            args = rl.parse_args(["check-forward", "--checkpoint", "fake", "--data", temp, "--precision", "fp32"])
+            with patch.object(rl, "load", return_value=runtime), patch("builtins.print") as output:
+                self.assertTrue(rl.check_forward(args))
+                record = json.loads(output.call_args.args[0])
+                self.assertLess(record["max_abs_dlogit"], 1e-5)
+                self.assertEqual(record["argmax_agreement"], 1)
+                self.assertGreater(record["tree_seconds"], 0)
+                self.assertGreater(record["paths_seconds"], 0)
+                def perturbed(model, examples, pad):
+                    logits, valid = tree_forward(model, examples, pad)
+                    logits[:, 0] += 10
+                    return logits, valid
+                with patch.object(rl, "tree_forward", side_effect=perturbed):
+                    self.assertFalse(rl.check_forward(args))
+                    self.assertGreater(json.loads(output.call_args.args[0])["max_abs_dprob"], .02)
+
     def test_scorer_packs_and_restores_order(self):
         import torch
         model = tiny_model()
@@ -450,7 +744,7 @@ class TorchTests(unittest.TestCase):
             requests.append({key: row[key] for key in ("id", "state", "questions")})
         examples = prepare_examples({"states": requests}, predictor.tokenizer, predictor.limit)
         budget = max(len(leaf) for ex in examples for leaf in ex["leaf_tokens"]) * 4
-        scorer = rl.Scorer(predictor, budget)
+        scorer = rl.Scorer(predictor, budget, "paths")
         outputs = scorer(requests)
         self.assertEqual([batch[0] for batch in model.batches], ["1:action", "2:action", "0:action"])
         self.assertFalse(model.training)
@@ -477,7 +771,7 @@ class TorchTests(unittest.TestCase):
                 stats = []
                 for current, budget in ((model, 28), (reference, 1000)):
                     args = SimpleNamespace(minibatches=1, output_dir="unused", precision="fp32", clip=.2,
-                                           max_microbatch_tokens=budget, grad_clip=100)
+                                           max_microbatch_tokens=budget, grad_clip=100, forward="paths")
                     scorer = SimpleNamespace(model=current, tokenizer=FakeTokenizer())
                     optimizer = torch.optim.SGD(current.parameters(), lr=.01)
                     with patch.object(rl, "heartbeat"):

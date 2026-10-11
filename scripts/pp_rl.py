@@ -13,6 +13,7 @@ import subprocess
 import time
 
 from pp_envpool import EnvPool
+from pp_tree import tree_forward, tree_tokens
 from predict_toy_decisions import DecisionPredictor, prepare_examples
 from unified_game_pipeline import POLICY_QUESTION, behavior_distribution, choose, policy_request, read_rows
 
@@ -26,10 +27,18 @@ def load(checkpoint_dir, max_length=8192, precision="bf16"):
                              disable_native_triton=True)
 
 
-def pack(examples, budget):
+def sequence_sizes(examples, forward):
+    if forward == "tree":
+        return [(1, len(tree_tokens(ex)[0])) for ex in examples]
+    if forward == "paths":
+        return [(len(ex["leaf_tokens"]), max(map(len, ex["leaf_tokens"]))) for ex in examples]
+    raise ValueError(f"Unknown forward: {forward}")
+
+
+def pack(examples, budget, forward="tree"):
     if budget <= 0:
         raise ValueError("Token budget must be positive")
-    sizes = [(len(ex["leaf_tokens"]), max(map(len, ex["leaf_tokens"]))) for ex in examples]
+    sizes = sequence_sizes(examples, forward)
     batches, batch, paths, longest = [], [], 0, 0
     for index in sorted(range(len(examples)), key=lambda i: sizes[i][1]):
         count, length = sizes[index]
@@ -46,20 +55,22 @@ def pack(examples, budget):
     return batches
 
 
-def token_counts(examples, batches):
+def token_counts(examples, batches, forward="tree"):
+    sizes = sequence_sizes(examples, forward)
     return {"forward_calls": len(batches), "questions": len(examples),
             "leaf_paths": sum(len(ex["leaf_tokens"]) for ex in examples),
-            "tokens": sum(len(leaf) for ex in examples for leaf in ex["leaf_tokens"]),
-            "padded_tokens": sum(sum(len(examples[i]["leaf_tokens"]) for i in batch) *
-                                 max(len(leaf) for i in batch for leaf in examples[i]["leaf_tokens"])
+            "tokens": (sum(length for _, length in sizes) if forward == "tree" else
+                       sum(len(leaf) for ex in examples for leaf in ex["leaf_tokens"])),
+            "padded_tokens": sum(sum(sizes[i][0] for i in batch) * max(sizes[i][1] for i in batch)
                                  for batch in batches)}
 
 
 class Scorer:
-    def __init__(self, predictor, max_forward_tokens=262144):
+    def __init__(self, predictor, max_forward_tokens=140000, forward="tree"):
         self.model, self.tokenizer = predictor.model, predictor.tokenizer
         self.max_length, self.precision = predictor.limit, predictor.precision
         self.max_forward_tokens = max_forward_tokens
+        self.forward = forward
         self.tokens = Counter()
 
     def __call__(self, requests):
@@ -69,14 +80,16 @@ class Scorer:
         examples = prepare_examples({"states": requests}, self.tokenizer, self.max_length)
         if len(examples) != len(requests) or any(ex["qid"] != "action" for ex in examples):
             raise ValueError("Scorer requires one action question per request")
-        batches = pack(examples, self.max_forward_tokens)
-        self.tokens.update(token_counts(examples, batches))
+        batches = pack(examples, self.max_forward_tokens, self.forward)
+        self.tokens.update(token_counts(examples, batches, self.forward))
         results = [None] * len(examples)
         self.model.eval()
         with torch.inference_mode():
             for batch in batches:
                 with torch.autocast("cuda", dtype=torch.bfloat16, enabled=self.precision == "bf16"):
-                    logits, _ = self.model([examples[i] for i in batch], self.tokenizer.pad_token_id)
+                    group = [examples[i] for i in batch]
+                    logits, _ = (tree_forward(self.model, group, self.tokenizer.pad_token_id)
+                                 if self.forward == "tree" else self.model(group, self.tokenizer.pad_token_id))
                 for index, values in zip(batch, logits):
                     ids = examples[index]["candidate_ids"]
                     values = values[:len(ids)].float().log_softmax(-1)
@@ -164,6 +177,17 @@ def run_episodes(scorer, pool, jobs, mode, temperature=1.0, epsilon=0.0, seed=17
             progress({"wave": wave, "operation": "step", "live": len(live)})
         accept(pool.step(actions))
     return [episodes[job["key"]] for job in jobs]
+
+
+def eval_episodes(scorer, pool, jobs, mode, max_concurrent=256, **kwargs):
+    if max_concurrent < 1:
+        raise ValueError("max_concurrent must be positive")
+    if len({job["key"] for job in jobs}) != len(jobs):
+        raise ValueError("Duplicate episode keys")
+    episodes = []
+    for offset in range(0, len(jobs), max_concurrent):
+        episodes.extend(run_episodes(scorer, pool, jobs[offset:offset + max_concurrent], mode, **kwargs))
+    return episodes
 
 
 def group_advantages(rewards):
@@ -287,12 +311,16 @@ def run_eval(args):
         raise ValueError("Evaluation output or summary already exists")
     cases = select_cases(args.cases, args.splits)
     started = time.monotonic()
-    scorer = Scorer(load(args.checkpoint, args.max_length, args.precision), args.max_forward_tokens)
+    scorer = Scorer(load(args.checkpoint, args.max_length, args.precision), args.max_forward_tokens, args.forward)
     jobs = [{"key": f"{case['id']}#r{j}", "case": case} for case in cases for j in range(args.rollouts)]
     with EnvPool(args.workers) as pool:
-        episodes = run_episodes(scorer, pool, jobs, args.mode, args.temperature, args.epsilon, args.seed)
+        episodes = eval_episodes(scorer, pool, jobs, args.mode, args.max_concurrent,
+                                 temperature=args.temperature, epsilon=args.epsilon, seed=args.seed)
     summary = dict(summarize(episodes), wall_seconds=time.monotonic() - started,
-                   checkpoint=str(Path(args.checkpoint).resolve()), mode=args.mode)
+                   checkpoint=str(Path(args.checkpoint).resolve()), mode=args.mode,
+                   forward=args.forward, max_forward_tokens=args.max_forward_tokens,
+                   rollouts=args.rollouts, epsilon=args.epsilon, temperature=args.temperature,
+                   seed=args.seed, cases=str(Path(args.cases).resolve()), max_concurrent=args.max_concurrent)
     output.parent.mkdir(parents=True, exist_ok=True)
     with output.open("x") as handle:
         for episode in episodes:
@@ -324,6 +352,65 @@ def make_cases(args):
             row = dict(id=f"{args.split}-sonic_predict_position-{seed}", seed=seed, spec=spec,
                        split=args.split, variant="doom_predict_position")
             handle.write(json.dumps(row) + "\n")
+
+
+def forward_check_rows(path, count):
+    policy, other = [], []
+    for row in read_rows(path):
+        metadata = row.get("metadata", {})
+        pp = metadata.get("spec", {}).get("scenario") == "predict_position"
+        if pp and metadata.get("record_role") == "policy" and len(policy) < count:
+            policy.append(row)
+        elif not pp and len(other) < 16:
+            other.append(row)
+        if len(policy) == count and len(other) == 16:
+            break
+    if not policy:
+        raise ValueError(f"No PP policy rows in {path}")
+    return [{key: row[key] for key in ("id", "state", "questions")} for row in policy + other]
+
+
+def check_forward(args):
+    import torch
+    runtime = load(args.checkpoint, args.max_length, args.precision)
+    rows = forward_check_rows(Path(args.data) / "dev.jsonl", args.count)
+    examples = prepare_examples({"states": rows}, runtime.tokenizer, args.max_length)
+    model, pad = runtime.model, runtime.tokenizer.pad_token_id
+    model.eval()
+    device = model.scalar.weight.device
+
+    def synchronize():
+        if device.type == "cuda":
+            torch.cuda.synchronize(device)
+
+    timings = Counter(paths_seconds=0.0, tree_seconds=0.0)
+    max_logit, max_prob, agreement = 0.0, 0.0, 0
+    finite = True
+    with torch.inference_mode():
+        # One question at a time bounds memory for arbitrary supported question types.
+        for example in examples:
+            outputs = []
+            for forward in ("paths", "tree"):
+                synchronize()
+                started = time.perf_counter()
+                with torch.autocast("cuda", dtype=torch.bfloat16, enabled=args.precision == "bf16"):
+                    logits, valid = (tree_forward(model, [example], pad) if forward == "tree"
+                                     else model([example], pad))
+                synchronize()
+                timings[forward + "_seconds"] += time.perf_counter() - started
+                outputs.append(logits[valid].float())
+            paths, tree = outputs
+            dlogit = float((paths - tree).abs().max())
+            dprob = float((paths.softmax(-1) - tree.softmax(-1)).abs().max())
+            finite &= math.isfinite(dlogit) and math.isfinite(dprob)
+            max_logit, max_prob = max(max_logit, dlogit), max(max_prob, dprob)
+            agreement += int(paths.argmax() == tree.argmax())
+    summary = dict(max_abs_dlogit=max_logit if finite else None,
+                   max_abs_dprob=max_prob if finite else None,
+                   argmax_agreement=agreement / len(examples), questions=len(examples),
+                   rows=len(rows), precision=args.precision, **timings)
+    print(json.dumps(summary, allow_nan=False), flush=True)
+    return finite and agreement == len(examples) and max_prob <= 0.02
 
 
 def saved_args(args):
@@ -402,17 +489,18 @@ def update_model(scorer, optimizer, examples, args, step, grpo):
     import torch
     parts = split_minibatches(examples, args.minibatches if grpo else 1)
     metrics = ["mean_loss"] + (["mean_abs_ratio_minus_one", "clip_fraction", "mean_old_minus_new_logp"] if grpo else [])
-    totals, tokens, norms = Counter(dict.fromkeys(metrics, 0)), Counter(token_counts([], [])), []
+    totals, tokens, norms = Counter(dict.fromkeys(metrics, 0)), Counter(token_counts([], [], args.forward)), []
     scorer.model.train()
     for index, part in enumerate(parts):
         heartbeat(args.output_dir, step, "update", {"index": index + 1, "total": len(parts)})
-        batches = pack(part, args.max_microbatch_tokens)
-        tokens.update(token_counts(part, batches))
+        batches = pack(part, args.max_microbatch_tokens, args.forward)
+        tokens.update(token_counts(part, batches, args.forward))
         optimizer.zero_grad(set_to_none=True)
         for batch in batches:
             group = [part[i] for i in batch]
             with torch.autocast("cuda", dtype=torch.bfloat16, enabled=args.precision == "bf16"):
-                logits, _ = scorer.model(group, scorer.tokenizer.pad_token_id)
+                logits, _ = (tree_forward(scorer.model, group, scorer.tokenizer.pad_token_id)
+                             if args.forward == "tree" else scorer.model(group, scorer.tokenizer.pad_token_id))
             logps = torch.stack([values[:len(ex["candidate_ids"])].float().log_softmax(-1)[ex["target"]]
                                 for values, ex in zip(logits, group)])
             if grpo:
@@ -464,8 +552,11 @@ def game_eval(scorer, pool, cases, args, step, dev_rows=None):
         heartbeat(args.output_dir, step, "eval", {"mode": mode})
         jobs = [{"key": f"{case['id']}#eval-{mode}", "case": case} for case in cases]
         progress = lambda detail: heartbeat(args.output_dir, step, "eval", {"mode": mode, **detail})
-        episodes = run_episodes(scorer, pool, jobs, mode, seed=args.seed, progress=progress)
-        record = dict(step=step, mode=mode, **summarize(episodes))
+        episodes = eval_episodes(scorer, pool, jobs, mode, args.max_concurrent, seed=args.seed, progress=progress)
+        record = dict(step=step, mode=mode, forward=args.forward, max_forward_tokens=args.max_forward_tokens,
+                      rollouts=1, epsilon=0.0, temperature=1.0, seed=args.seed,
+                      cases=str(Path(args.cases).resolve()), max_concurrent=args.max_concurrent,
+                      **summarize(episodes))
         if ce is not None:
             record["supervised"] = ce
         append(path, record)
@@ -526,7 +617,7 @@ def train(args):
     heartbeat(out, completed, "load", {})
     torch.manual_seed(args.seed)
     runtime = load(last or args.init_checkpoint, args.max_length, args.precision)
-    scorer, model = Scorer(runtime, args.max_forward_tokens), runtime.model
+    scorer, model = Scorer(runtime, args.max_forward_tokens, args.forward), runtime.model
     if not args.no_gradient_checkpointing:
         model.backbone.gradient_checkpointing_enable(gradient_checkpointing_kwargs={"use_reentrant": False})
     optimizer = torch.optim.AdamW([
@@ -602,7 +693,9 @@ def train(args):
             del examples, items
             if step % args.eval_every == 0 or step == total:
                 game_eval(scorer, pool, eval_cases, args, step, dev_rows)
-            save(step, snapshot=step % args.save_every == 0 or step == total)
+            snapshot = step % args.save_every == 0 or step == total
+            if grpo or snapshot:
+                save(step, snapshot=snapshot)
         heartbeat(out, total, "complete", {})
 
 
@@ -615,6 +708,10 @@ def parse_args(argv=None):
     cases.add_argument("--seed-start", type=int, default=9400000)
     cases.add_argument("--split", default="heldout")
     cases.add_argument("--exclude", default="configs/sonic_predict_supervision_v1_cases.jsonl")
+    check = commands.add_parser("check-forward")
+    check.add_argument("--checkpoint", required=True)
+    check.add_argument("--data", required=True)
+    check.add_argument("--count", type=int, default=64)
     evaluation = commands.add_parser("eval")
     evaluation.add_argument("--checkpoint", required=True)
     evaluation.add_argument("--output", required=True)
@@ -646,18 +743,21 @@ def parse_args(argv=None):
         command.add_argument("--head-lr", type=float, default=1e-4)
         command.add_argument("--weight-decay", type=float, default=.01)
         command.add_argument("--grad-clip", type=float, default=1.0)
-        command.add_argument("--max-microbatch-tokens", type=int, default=32768)
+        command.add_argument("--max-microbatch-tokens", type=int, default=34000)
         command.add_argument("--no-gradient-checkpointing", action="store_true")
         command.add_argument("--resume", action="store_true")
     for command in (evaluation, grpo, sft):
         command.add_argument("--cases", required=True)
         command.add_argument("--seed", type=int, default=17)
         command.add_argument("--workers", type=int, default=28)
+        command.add_argument("--forward", choices=["tree", "paths"], default="tree")
+        command.add_argument("--max-forward-tokens", type=int, default=140000)
+        command.add_argument("--max-concurrent", type=int, default=256)
+    for command in (evaluation, grpo, sft, check):
         command.add_argument("--precision", choices=["bf16", "fp32"], default="bf16")
         command.add_argument("--max-length", type=int, default=8192)
-        command.add_argument("--max-forward-tokens", type=int, default=262144)
     args = parser.parse_args(argv)
-    for name in ("count", "workers", "max_length", "max_forward_tokens", "max_microbatch_tokens", "rollouts",
+    for name in ("count", "workers", "max_length", "max_forward_tokens", "max_microbatch_tokens", "max_concurrent", "rollouts",
                  "steps", "updates", "tasks_per_step", "group_size", "minibatches", "batch_questions", "eval_every", "save_every"):
         if hasattr(args, name) and getattr(args, name) <= 0:
             parser.error(f"--{name.replace('_', '-')} must be positive")
@@ -679,6 +779,9 @@ def main(argv=None):
         make_cases(args)
     elif args.command == "eval":
         run_eval(args)
+    elif args.command == "check-forward":
+        if not check_forward(args):
+            raise SystemExit(1)
     else:
         train(args)
 
