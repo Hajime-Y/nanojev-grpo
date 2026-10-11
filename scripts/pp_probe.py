@@ -3,6 +3,7 @@
 import argparse
 from collections import Counter
 from concurrent.futures import ThreadPoolExecutor, as_completed
+from functools import partial
 import http.client
 import json
 import math
@@ -171,7 +172,12 @@ class PolicyScorer:
                 for answer in self.engine(requests)]
 
 
-def lookahead_hook(pool, episodes, requests):
+EXPLAINED_QUESTION = ("Each option below ends with a simulated result: code has already played that option in the game "
+                      "and written down what actually happens. Choose the option whose simulated result kills the monster. "
+                      "If no option kills the monster, choose the option that waits.")
+
+
+def lookahead_hook(pool, episodes, requests, instructions=None):
     jobs, identities = [], []
     for request in requests:
         episode = episodes[request["id"]]
@@ -189,6 +195,8 @@ def lookahead_hook(pool, episodes, requests):
         question = request["questions"]["action"]
         question["criteria"] = {a: text + annotation(a, extra[request["id"]]["lookahead"][a])
                                 for a, text in question["criteria"].items()}
+        if instructions is not None:
+            question["instructions"] = instructions
     return extra
 
 
@@ -431,7 +439,7 @@ def parse_args(argv=None):
         command.add_argument("--workers", type=int, default=28)
         command.add_argument("--seed", type=int, default=17)
     play.add_argument("--mode", choices=("greedy", "sample"), default="greedy")
-    play.add_argument("--annotate", choices=("none", "lookahead"), default="none")
+    play.add_argument("--annotate", choices=("none", "lookahead", "lookahead_explained"), default="none")
     build.add_argument("--behaviors", default="policy_noshoot,random_noshoot")
     build.add_argument("--stride", type=int, default=3)
     for command in (score, reporting):
@@ -442,7 +450,7 @@ def parse_args(argv=None):
     for name in ("workers", "max_concurrent", "stride", "jev_concurrency", "max_length", "max_forward_tokens"):
         if hasattr(args, name) and getattr(args, name) < 1:
             parser.error(f"--{name.replace('_', '-')} must be positive")
-    if args.command == "play" and args.engine == "oracle" and args.annotate != "lookahead":
+    if args.command == "play" and args.engine == "oracle" and args.annotate == "none":
         parser.error("oracle requires --annotate lookahead")
     return args
 
@@ -477,7 +485,9 @@ def main(argv=None):
                 episodes = rl.eval_episodes(PolicyScorer(engine), pool,
                                              [dict(key=f"{c['id']}#r0", case=c) for c in cases],
                                              effective_mode, args.max_concurrent, seed=args.seed,
-                                             decision_hook=lookahead_hook if args.annotate == "lookahead" else None)
+                                             decision_hook=None if args.annotate == "none" else partial(
+                                                 lookahead_hook, instructions=EXPLAINED_QUESTION
+                                                 if args.annotate == "lookahead_explained" else None))
             write_rows(output, episodes)
             result = dict(rl.summarize(episodes), engine=args.engine, annotate=args.annotate,
                           mode=args.mode, effective_mode=effective_mode, **engine.summary(),

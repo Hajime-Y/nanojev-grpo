@@ -198,6 +198,20 @@ class PlayTests(unittest.TestCase):
         self.assertEqual(probe.annotation("noop", False), " Simulated result: shooting right after this misses the monster.")
         self.assertEqual(ACTIONS["shoot"], "Hold attack.")
 
+    def test_explained_annotations_replace_only_the_instructions(self):
+        from functools import partial
+        plain, explained = FakeScorer(), FakeScorer()
+        with EnvPool(2, factory=ProbeEnv) as pool:
+            rl.run_episodes(plain, pool, jobs(2), "greedy", decision_hook=probe.lookahead_hook)
+        with EnvPool(2, factory=ProbeEnv) as pool:
+            rl.run_episodes(explained, pool, jobs(2), "greedy",
+                            decision_hook=partial(probe.lookahead_hook, instructions=probe.EXPLAINED_QUESTION))
+        first, second = plain.requests[0], explained.requests[0]
+        self.assertEqual(first["questions"]["action"]["instructions"], rl.POLICY_QUESTION)
+        self.assertEqual(second["questions"]["action"]["instructions"], probe.EXPLAINED_QUESTION)
+        self.assertEqual(first["questions"]["action"]["criteria"], second["questions"]["action"]["criteria"])
+        self.assertEqual(first["state"], second["state"])
+
     def test_oracle_preferences_and_timing(self):
         engine = probe.OracleEngine()
         with self.assertRaisesRegex(ValueError, "annotations"):
