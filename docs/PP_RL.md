@@ -229,3 +229,49 @@ loopback port. If a sandbox denies binding localhost, those server integration
 tests skip with the permission error; separate mocked-transport contracts still
 check bundling, rounding, retries, hard failures and partial-result persistence.
 Existing numerical tests skip when torch is absent.
+
+## Snake lookup and look-ahead probe
+
+`scripts/pp_snake_probe.py` runs on a laptop with the Python standard library;
+no training or GPU is involved. It measures explicit body-cell lookup, one-step
+collision avoidance, and existential survival for a chosen move plus `--depth`
+further moves. Look-ahead grows only on the current food, then leaves food absent;
+vacating-tail entry is legal and a full-board win counts as survival.
+
+```bash
+python3 scripts/pp_snake_probe.py build --output /tmp/snake-probe.jsonl \
+  --sizes 8,10 --seeds 400 --min-length 8 --depth 5 --per-class 100 --seed 17
+python3 scripts/pp_snake_probe.py ask --probe /tmp/snake-probe.jsonl \
+  --output /tmp/snake-jev.jsonl --engine jev
+# Set OPENROUTER_API_KEY in the environment before chat calls.
+python3 scripts/pp_snake_probe.py ask --probe /tmp/snake-probe.jsonl \
+  --output /tmp/snake-chat-off.jsonl --engine chat --chat-model MODEL_ID --reasoning off
+python3 scripts/pp_snake_probe.py ask --probe /tmp/snake-probe.jsonl \
+  --output /tmp/snake-chat-on.jsonl --engine chat --chat-model MODEL_ID --reasoning on
+python3 scripts/pp_snake_probe.py report --probe /tmp/snake-probe.jsonl \
+  --answers jev=/tmp/snake-jev.jsonl off=/tmp/snake-chat-off.jsonl on=/tmp/snake-chat-on.jsonl \
+  --output /tmp/snake-report.json
+python3 -m unittest scripts/test_pp_snake_probe.py
+```
+
+All kinds sample the same seeded rollout pool, using exact environment observation
+text at reset. Each kind has equal true/false counts and at most one item per
+physical state (duplicates across episodes are collapsed); balanced subsets are
+sampled uniformly, independently across kinds, so they need not be paired by state.
+Build writes `OUT.summary.json` with counts, body-length quantiles, and parameters.
+Metadata preserves the source snapshot for auditing but is never sent to models.
+
+Ask appends results as threads finish, retries 408/429/5xx and connection failures
+three times after the initial attempt, and records per-item hard errors. Repeating
+the command skips completed IDs (including unparseable replies) and retries errors;
+a torn final line is repaired. Keep the same probe, engine, model, and reasoning
+setting when resuming; use separate answer files for comparisons. Jev needs no key;
+chat reads `OPENROUTER_API_KEY` at call time. Request headers are never logged.
+Answer summaries count errors and unparseable replies separately, sum usage from
+the effective saved rows and this invocation, and give this invocation's wall time.
+
+Reports count missing/error/unparseable answers as wrong, including in each gold
+class's accuracy. `share_yes` uses parsed Boolean answers as its denominator;
+rank AUC uses available valid `p_yes` values with half credit for ties (`auc_n`
+gives coverage). Undefined metrics are null. Tests use injected fake transports
+and never open sockets.
