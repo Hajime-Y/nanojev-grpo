@@ -3,6 +3,7 @@
 import argparse
 from collections import Counter
 from concurrent.futures import ThreadPoolExecutor, as_completed
+import http.client
 import json
 import math
 from pathlib import Path
@@ -73,7 +74,7 @@ class JevEngine:
                         raise HTTPError(self.url, response.status, "Non-200 response", response.headers, response)
                     payload = json.load(response)
                 break
-            except (HTTPError, URLError, TimeoutError) as exc:
+            except (HTTPError, URLError, TimeoutError, ConnectionError, http.client.HTTPException) as exc:
                 if isinstance(exc, HTTPError):
                     exc.close()
                 if attempt == self.retries:
