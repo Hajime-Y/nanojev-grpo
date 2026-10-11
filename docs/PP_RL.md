@@ -121,3 +121,111 @@ abort the pool. A transient `last.old` directory allows recovery during replacem
 CPU contract tests (torch-only numerical tests skip when torch is absent):
 `python3 -m unittest scripts/test_pp_rl.py`. Real CUDA memory use, numerical
 training behavior and ViZDoom throughput must be checked on the GPU host.
+
+## Predict Position measurement harness
+
+`scripts/pp_probe.py` measures explicit state reading separately from action
+consequence prediction. It performs inference and deterministic replays only;
+none of its commands trains or updates a model. Use the same cases and mode when
+comparing unannotated and annotated play. These measurements provide evidence
+about performance on these tasks; annotated success alone does not establish
+that a model predicts consequences independently of the supplied simulation.
+
+```bash
+# Baseline policy and the same policy with code-written consequences.
+python scripts/pp_probe.py play --engine checkpoint --checkpoint /models/released \
+  --cases /tmp/pp-heldout.jsonl --splits heldout --mode greedy \
+  --annotate none --workers 28 --max-concurrent 128 --output runs/pp-plain.jsonl
+python scripts/pp_probe.py play --engine checkpoint --checkpoint /models/released \
+  --cases /tmp/pp-heldout.jsonl --splits heldout --mode greedy \
+  --annotate lookahead --workers 28 --output runs/pp-lookahead.jsonl
+
+# Simulation-based controller: shoot on a hit; otherwise prefer noop, left, right
+# if that action followed by shoot hits; otherwise noop.
+python scripts/pp_probe.py play --engine oracle --annotate lookahead \
+  --cases /tmp/pp-heldout.jsonl --splits heldout --output runs/pp-oracle.jsonl
+
+# Collect states under policies that never choose shoot.
+python scripts/pp_probe.py build --checkpoint /models/released \
+  --cases /tmp/pp-probe-cases.jsonl --splits probe \
+  --behaviors policy_noshoot,random_noshoot --stride 3 --seed 17 \
+  --output runs/pp-probe.jsonl
+
+python scripts/pp_probe.py score --engine checkpoint --checkpoint /models/released \
+  --probe runs/pp-probe.jsonl --questions policy,boolean --output runs/pp-local-scores.jsonl
+python scripts/pp_probe.py score --engine jev \
+  --jev-url http://127.0.0.1:8791/v1/systemone --jev-model typesafe/jev-1.13 \
+  --jev-concurrency 12 --probe runs/pp-probe.jsonl --output runs/pp-jev-scores.jsonl
+
+python scripts/pp_probe.py report --probe runs/pp-probe.jsonl \
+  --scores local=runs/pp-local-scores.jsonl jev=runs/pp-jev-scores.jsonl \
+  --output runs/pp-probe-report.json
+```
+
+`play` reuses `pp_rl.run_episodes`, including decisions during the firing
+animation and the noop drain after ammo reaches zero. It retains complete
+decision states and candidate descriptions. With `--annotate lookahead`, each
+candidate is replayed from reset using the live episode's exact action history.
+For shoot, the suffix is shoot then noop to termination; for another action it
+is that action, shoot, then noop to termination. Only candidate descriptions
+change. Each decision saves the resulting `lookahead` Boolean map. Replays
+use the existing worker pool and its free environments without disturbing live
+episodes, even when replay keys overlap live keys. `EnvPool.replay` returns
+success, terminal reason, total environment steps, and whether termination
+occurred within the supplied prefix (including its last action).
+
+`play --engine random` returns uniform policy probabilities and always samples,
+including with `--mode greedy`; summaries distinguish `mode` from
+`effective_mode`. Sampling uses the same per-episode stable seed as PP evaluation,
+so batching does not change an episode's random choices. The oracle requires
+lookahead annotations. Play summaries include engine, annotation mode, API calls,
+input tokens, and the number of decisions with at least one simulated kill.
+For unannotated play the latter is zero because no lookahead was measured.
+
+`build` samples the full checkpoint policy renormalized over left/right/noop at
+temperature 1, or a uniform distribution over those actions. Saved rows are
+pre-action observations at t=0, stride, ...; their history excludes action t.
+Their `hit_now` label comes from replaying that history, shoot, then noop to the
+end. Features use only the visible non-DoomPlayer label in the newest snapshot;
+missing monster centers and motion are JSON null. Side uses a 16-pixel center
+band, while explicit Boolean gold uses an 8-pixel exclusion band for side and
+a 2-pixel exclusion band for motion. Missing/ambiguous explicit gold is omitted
+from the corresponding scoring request. The build summary contains row counts,
+hits and hit rates per behavior.
+
+`score` uses the original stored state and unannotated candidates. Checkpoint
+Boolean questions use the native `boolean` preparation and the same tree/paths
+forward as the policy. Jev receives one request per row containing its policy
+question and all defined Boolean questions (sent as `noul`). Choice probabilities
+are floored at 1e-6 and renormalized after taking logs to handle relay rounding;
+Boolean probabilities are used directly. The relay needs no credentials. HTTP
+failures, including 402, receive three client retries after the first attempt,
+then raise a hard error. There is no model fallback.
+
+Scoring appends and closes each completed row immediately, skipping IDs already
+present on resume. A torn final JSONL line is removed before resuming; malformed
+completed lines are errors. Successful in-flight rows are saved before a peer
+request's error is raised. Resume with the same engine, checkpoint, question set,
+and probe file; use a different output to change them. Score summary API counts
+cover the current invocation, count retry attempts as calls, and count input
+usage returned by successful responses. Play/build refuse existing output or
+summary files. All three write `OUT.summary.json` including their configuration.
+
+Reports contain each named scorer's per-behavior and pooled metrics. AUC uses
+average ranks for tied probabilities. Policy argmax ties use lexical action order,
+matching the evaluator; a turn-probability tie contributes one half. Boolean
+accuracy predicts true at p >= 0.5. Undefined AUC (only one class), empty means,
+and zero-denominator precision/recall are JSON null. Reports include total and
+scored counts and both base rates so partial score files are visible.
+
+Run offline contracts with:
+
+```bash
+python3 -m unittest scripts/test_pp_rl.py scripts/test_pp_probe.py
+```
+
+The probe tests use fake environments/scorers and a fake Jev HTTP server on a free
+loopback port. If a sandbox denies binding localhost, those server integration
+tests skip with the permission error; separate mocked-transport contracts still
+check bundling, rounding, retries, hard failures and partial-result persistence.
+Existing numerical tests skip when torch is absent.

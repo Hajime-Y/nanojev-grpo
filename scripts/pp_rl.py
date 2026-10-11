@@ -74,12 +74,18 @@ class Scorer:
         self.tokens = Counter()
 
     def __call__(self, requests):
-        import torch
         if not requests:
             return []
         examples = prepare_examples({"states": requests}, self.tokenizer, self.max_length)
         if len(examples) != len(requests) or any(ex["qid"] != "action" for ex in examples):
             raise ValueError("Scorer requires one action question per request")
+        return self.score_examples(examples)
+
+    def score_examples(self, examples):
+        """Shared inference for prepared choice and Boolean questions."""
+        import torch
+        if not examples:
+            return []
         batches = pack(examples, self.max_forward_tokens, self.forward)
         self.tokens.update(token_counts(examples, batches, self.forward))
         results = [None] * len(examples)
@@ -116,7 +122,9 @@ def action_distribution(ids, logps, mode, temperature, epsilon):
     return behavior_distribution(scores, mode, epsilon)
 
 
-def run_episodes(scorer, pool, jobs, mode, temperature=1.0, epsilon=0.0, seed=17, progress=None):
+def run_episodes(scorer, pool, jobs, mode, temperature=1.0, epsilon=0.0, seed=17, progress=None,
+                 decision_hook=None):
+    """Optional hook(pool, episodes, requests) edits requests and returns per-key record fields."""
     action_distribution(["check"], [0.0], mode, temperature, epsilon)
     if len({job["key"] for job in jobs}) != len(jobs):
         raise ValueError("Duplicate episode keys")
@@ -157,21 +165,25 @@ def run_episodes(scorer, pool, jobs, mode, temperature=1.0, epsilon=0.0, seed=17
         if progress:
             progress({"wave": wave, "operation": "score", "live": len(live)})
         requests = [policy_request(current[key]["observation"], key) for key in keys]
+        extra = decision_hook(pool, episodes, requests) if decision_hook else {}
         outputs = scorer(requests)
         if len(outputs) != len(keys):
             raise ValueError("Scorer result count mismatch")
         actions = {}
-        for key, (ids, logps) in zip(keys, outputs):
+        for key, request, (ids, logps) in zip(keys, requests, outputs):
             obs, episode = current[key]["observation"], episodes[key]
             if set(ids) != set(obs["candidates"]):
                 raise ValueError(f"Scorer candidates mismatch: {key}")
             behavior = action_distribution(ids, logps, mode, temperature, epsilon)
-            action = actions[key] = choose(behavior, rngs[key])
+            # Exclude zero mass from choose's rounding fallback (e.g. masked shoot).
+            action = actions[key] = choose({a: p for a, p in behavior.items() if p > 0}, rngs[key])
             if action == "shoot" and episode["fire_decision"] is None:
                 episode["fire_decision"] = len(episode["decisions"])
-            episode["decisions"].append(dict(t=obs["step"], state=obs["state"], candidates=obs["candidates"],
+            episode["decisions"].append(dict(t=obs["step"], state=obs["state"],
+                                             candidates=request["questions"]["action"]["criteria"],
                                              action=action, logp=logps[ids.index(action)],
                                              probs=dict(zip(ids, map(math.exp, logps)))))
+            episode["decisions"][-1].update(extra.get(key, {}))
             episode["model_decisions"] += 1
         if progress:
             progress({"wave": wave, "operation": "step", "live": len(live)})

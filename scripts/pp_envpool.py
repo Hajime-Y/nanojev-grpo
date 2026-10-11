@@ -36,6 +36,27 @@ def _worker(pipe, factory, reuse):
                     active[key] = (spec, env)
                     obs, info = env.reset(value["seed"])
                     result[key] = dict(observation=obs, info=info)
+                elif op == "replay":
+                    case = value["case"]
+                    spec = json.dumps(case["spec"], sort_keys=True, separators=(",", ":"))
+                    env = free[spec].pop() if free[spec] else factory(case["spec"])
+                    try:
+                        env.reset(case["seed"])
+                        prefix, count, terminated = value["actions"], 0, False
+                        while not terminated:
+                            action = prefix[count] if count < len(prefix) else value["tail"]
+                            _, _, terminated, truncated, info = env.step(action)
+                            count += 1
+                            if truncated:
+                                raise RuntimeError("Environment truncated the replay")
+                        result[key] = dict(success=bool(info["success"]),
+                                           terminal_reason=info["terminal_reason"], steps=count,
+                                           terminated_in_prefix=count <= len(prefix))
+                    finally:
+                        if reuse:
+                            free[spec].append(env)
+                        else:
+                            env.close()
                 elif op in {"step", "drain"}:
                     spec, env = active[key]
                     count = 0
@@ -170,6 +191,17 @@ class EnvPool:
 
     def step(self, actions):
         return self._call("step", actions)
+
+    def replay(self, jobs):
+        """Replay independent prefixes without changing live episode ownership."""
+        keys = [job["key"] for job in jobs]
+        if len(set(keys)) != len(keys):
+            raise ValueError("Duplicate replay keys")
+        batches = defaultdict(dict)
+        for job in jobs:
+            batches[self.cursor % len(self.pipes)][job["key"]] = job
+            self.cursor += 1
+        return self._exchange("replay", batches)
 
     def drain(self, keys, action="noop"):
         return self._call("drain", dict.fromkeys(keys, action))
