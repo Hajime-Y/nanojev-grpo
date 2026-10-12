@@ -1,153 +1,154 @@
-# NanoJev — A nano replica of [Jev](https://typesafe.ai/blog/introducing-system-one-models-and-jev)
+# NanoJev-GRPO — 用 GRPO 对 NanoJev 决策模型做后训练
 
-**简体中文** | [English](README.md)
+[English](README.md) | **简体中文** | [日本語](README.ja.md)
 
-**一个 0.6B 并行决策模型：输入状态与问题，直接得到完整概率分布，无需生成答案 token。**
+> **本仓库是在 [TianyuCodings](https://github.com/TianyuCodings) 的 [NanoJev](https://github.com/TianyuCodings/NanoJev) 基础上做的非官方扩展。**
+> 决策模型、已发布的权重与数据集、游戏环境都是 NanoJev 的成果。本仓库从 NanoJev 的提交 [`76fdfc9`](https://github.com/TianyuCodings/NanoJev/tree/76fdfc9) 出发并保留其全部提交历史，在此之上加入了基于回合成败的强化学习（GRPO）。非常感谢原作者。新增部分如有错误，责任在我。
 
-> **新项目：[JevHarness](https://github.com/TianyuCodings/JevHarness)** — 让 LLM 围绕 [Jev](https://typesafe.ai/blog/introducing-system-one-models-and-jev) 编写面向具体任务的决策程序，并可利用奖励与执行轨迹进一步优化。附有可交互的 Pokémon 演示。
+![同一个 ViZDoom Predict Position 种子由三个权重分别游玩：已发布的权重和继续做 SFT 的权重立刻开火并打偏，GRPO 的权重先等待再命中](docs/assets/pp_train.gif)
 
-[体验 ViZDoom](https://nanojev-dev.tianyuchen99.chatgpt.site/?autoplay=1) · [Maze 与 Snake](https://nanojev-dev.tianyuchen99.chatgpt.site/side-by-side?autoplay=1#maze) · [模型](https://huggingface.co/C-Tianyu/NanoJev) · [数据集](https://huggingface.co/datasets/C-Tianyu/NanoJev-Data)
+*同一个种子、三个权重，由记录下来的操作回放得到。NanoJev 已发布的权重和在其基础上继续 SFT 的权重立刻开火并打偏；GRPO 的权重先等待再命中。在 128 个测试回合中，SFT 打偏而 GRPO 命中的有 36 个，反过来的有 11 个；这段动画是那 36 个之一。黄色标记是回放工具加上的。*
 
-**现在支持 ViZDoom：** 同一个 checkpoint 完成 Basic 的瞄准射击、Predict Position 的移动目标火箭射击，同时支持 Maze 和 Snake。
+## 本仓库想说明什么
 
-**4 项任务 · 每种数据版本 18,760 条决策问题 · 896 局 Predict Position 专家轨迹**
+决策模型在一次前向计算中给出每个候选项的概率，不生成文字。这让它很快，但也意味着它没有地方去“想”某个选择会带来什么后果。公开的游戏演示绕开这一点的办法是：由代码把每个选项都模拟一遍，再把结果写进输入。
 
-## 更新内容
+本仓库验证另一条路：把“往前看”的能力放进权重里。我们在 ViZDoom Predict Position 上用**以整个回合为单位的 GRPO** 训练 NanoJev（Qwen3-0.6B 加决策头）：不用专家动作，输入里也不写模拟结果，只用回合最后是否击杀这一个信号。
 
-**2026 年 9 月 20 日：一个模型，四款游戏。**
+| 权重 | 专家标签 | 640 个回合的成功率（贪心 / 采样） | 每次决策 8 tick 的条件（128） | ViZDoom Basic（128） |
+|---|---|---:|---:|---:|
+| NanoJev 已发布的权重 | — | 19.4% / 18.0% | 14 | 128 |
+| 用专家动作做 SFT | 使用 | 68.6% / 66.1% | 57 | 128 |
+| **从已发布权重做 GRPO** | **不使用** | **79.1% / 77.2%** | 34 | 107 |
+| 从 SFT 的平台期继续做 GRPO | 仅 SFT 部分 | 81.4% / 80.8% | 69 | 128 |
 
-- **ViZDoom Basic：** 测试成功 **128/128**，对比 [Jev](https://typesafe.ai/blog/introducing-system-one-models-and-jev) 的 **56/128**。
-- **ViZDoom Predict Position：** 测试成功数从本轮训练前的 **11/128** 提升至 **27/128**；同条件 [Jev](https://typesafe.ai/blog/introducing-system-one-models-and-jev) 为 **11/128**。策略学习何时转向、等待并向移动目标发射火箭。
-- **16,333 条 ViZDoom 问题：** 每种目标版本共 **18,760 条**混合任务问题，覆盖 train、dev、calibration、test 和 OOD 五个分区。
-- **一个模型，四款游戏：** 同一个 step-400 checkpoint 用 **225 次行动**完成 50×50 迷宫，并在完整存活 256 步的 Snake 对局中吃到 **30 个食物**。
+- 640 个回合由已发布的测试集（128）和 512 个未参与训练的种子组成。
+- SFT 和 GRPO 从同一份权重出发，使用相同的 512 个训练种子。在这 640 个回合中，只有 SFT 成功的有 72 个，只有 GRPO 成功的有 139 个（精确符号检验，p < 0.00001）。
+- SFT 在约 400 次更新后进入平台期，再训练 800 次也没有提升。GRPO 在没有标签的情况下超过了这个水平；从 SFT 平台期出发的 GRPO 还能继续上升。
 
-## 三个模型，并排回放
+![训练过程中在 512 个留出种子上的成功率：SFT 停在 65% 到 69%，单独的 GRPO 最终为 77%，从 SFT 平台期出发的 GRPO 最终为 81%](docs/assets/curves.png)
 
-**[Jev](https://typesafe.ai/blog/introducing-system-one-models-and-jev)、NanoJev 和未微调 Qwen** 的真实网页回放。下方动图自动循环，点击即可进入交互播放器。四款演示使用同一个当前 NanoJev checkpoint。交互开发站目前需要访问权限；也可按下方命令在本地播放所有录制案例。
+### 已知的弱点
 
-### ViZDoom Basic · 瞄准，再开火
+- **学到的是适合训练条件的打法。** GRPO 的策略是先等待再开火。把每次决策从 4 tick 改成 8 tick 后，128 个回合里有 75 个一枪未开（开了火的回合命中率为 64%，SFT 为 45%）；在 ViZDoom Basic 上的 21 次失败全部是超时。
+- **提高的是成功率；没有证据表明“往前看”本身比 SFT 更好。** 用 AUC 衡量开火概率能否区分“此刻开火会命中”和“会打偏”的状态（怪物可见且还有时间）：训练前 0.64，SFT 后 0.80，GRPO 后 0.76。
+- **贪心选择曾短暂崩溃**，发生在 GRPO 的第 20 步左右；采样评估没有崩溃。
+- **最后一行与 GRPO 那一行不是受控对比。** 它使用 1,600 个新种子、每步 32 个种子、每步更新 2 次、学习率为三分之一。
+- **规模很小：** 每行只训练一次，只有一个游戏，模型为 0.6B。
 
-[![NanoJev 调整位置后一枪消灭目标，Jev 和未微调 Qwen 未能消灭目标，三组按同一游戏时钟并排播放](assets/basic_unified_autoplay.gif)](https://nanojev-dev.tianyuchen99.chatgpt.site/?autoplay=1)
+## 原因：模型会读，但不会往前看
 
-移动到位，对准目标，再开火。NanoJev 在 **1.40 秒内一枪消灭目标**；[Jev](https://typesafe.ai/blog/introducing-system-one-models-and-jev) 和未微调 Qwen 各开 **19 枪**，直到时限结束仍未消灭目标。三栏按同一游戏时钟同步播放，展示原始画面与动作概率。
+同一个任务上，我们也测了托管的 Jev 模型（`typesafe/jev-1.13`）。
 
-### 找到出口 · 50×50 Maze
+![同一个种子由 Jev 游玩两次：输入保持原样时它一直选择开火直到超时，候选项里写入代码模拟的结果后则命中](docs/assets/pp_jev.gif)
 
-[![Jev、当前 NanoJev 与未微调 Qwen 在网页三栏播放器中探索同一张 50×50 迷宫](assets/maze_unified_autoplay.gif)](https://nanojev-dev.tianyuchen99.chatgpt.site/side-by-side?autoplay=1#maze)
+| 由谁选择 | 候选项里写了什么 | 成功数（128 个测试回合） |
+|---|---|---:|
+| 均匀随机 | — | 12 |
+| Jev | 原始文本，例如 `Hold attack for 4 Doom ticks.` | 0 |
+| Jev | 原始文本 + 代码模拟出的结果 | 112 |
+| Jev | 同上，再加一句解释标注含义的指令 | 126 |
+| 只用代码：选择文本里写着“击杀”的选项 | — | 126 |
 
-NanoJev 用 **225 次行动**到达出口，[Jev](https://typesafe.ai/blog/introducing-system-one-models-and-jev) 用 **2,738 次**，未微调 Qwen 用 **4,726 次**。三组都通过局部安全概率驱动相同探索代码，并记住已经走通的路径。
+- 带标注时 Jev 成功的 126 个回合，与只用代码的规则成功的 126 个回合完全相同。
+- 对于读一下状态就能回答的问题（怪物是否在屏幕中心右侧），Jev 的正确率为 97.7%。它的开火概率不能区分命中和打偏（AUC 0.49）。
+- 在所有规则都已知的 Snake 上，Jev 在查找类问题上为 100%，把规则往前应用一步时为 63.5%，往前五步时为 70.0%。先推理再回答的对话 LLM 分别达到 98–100% 和 72–99%；同样的 LLM 只用一个词回答时，五步问题降到 39.5–50.5%。差别来自回答之前能不能先思考。
 
-[打开 Snake](https://nanojev-dev.tianyuchen99.chatgpt.site/side-by-side?autoplay=1#snake) · [打开 Predict Position](https://nanojev-dev.tianyuchen99.chatgpt.site/predict-position?autoplay=1)
+## GRPO 如何用在决策模型上
 
-## 核心能力
+![一个种子游玩 16 次，每个回合根据成败得到组内相对优势，该回合中的每一次决策都用这个优势更新](docs/assets/grpo.png)
 
-- **并行决策：** 将独立状态、问题和候选路径放入同一次 backbone 前向计算。
-- **动态候选：** Choice 通过共享评分头，返回所提供的 2–255 个候选的完整分布。
-- **布尔与等级问题：** 输出一个命题成立的概率，或 2–10 个有序等级的分布及期望。
-- **直接输出概率：** 可用于排序、贪心选择或采样，无需生成答案 token。
-- **轻量统一底座：** Qwen3-0.6B 加决策头，支持四款游戏及持久推理服务。
+它就是用于 LLM 的 GRPO，只做了两处替换：一个动作是在候选项中做的一次选择，而不是一个 token；一条轨迹是一个回合（20 到 30 次决策），而不是一段回答。
 
-每个请求包含**状态、问题和候选集合**。模型编码候选路径，再由共享决策头输出概率。Choice 使用集合注意力与 softmax，Boolean 使用 sigmoid，Score 返回等级的概率加权期望。
+```text
+A_i     = (r_i - mean(r)) / std(r)                      r_i 为 0 或 1，在同一种子的 16 个回合内计算
+rho_i,t = pi_theta(a_i,t | s_i,t) / pi_old(a_i,t | s_i,t)
+L       = - 对所有决策取平均  min(rho_i,t * A_i, clip(rho_i,t, 1 - eps, 1 + eps) * A_i),   eps = 0.2
+```
 
-## 完整测试结果
+16 个回合结果全部相同的组不含任何信号，直接丢弃。没有 critic，没有 KL 项，也没有参考模型。对应的两个函数是 [`scripts/pp_rl.py`](scripts/pp_rl.py) 里的 `group_advantages` 和 `clipped_loss`；完整说明见 [`docs/PP_RL.md`](docs/PP_RL.md)。
 
-以下为 **274 个测试案例**的成功数。各系统使用相同观察接口、候选动作和固定随机种子的 epsilon-greedy 控制器：
-
-| 模型 | Maze | Snake | Basic | Predict Position |
-|---|---:|---:|---:|---:|
-| **NanoJev** | **4/10** | **8/8** | **128/128** | **27/128** |
-| [Jev](https://typesafe.ai/blog/introducing-system-one-models-and-jev) | 7/10 | 8/8 | 56/128 | 11/128 |
-| 未微调 Qwen3-0.6B | 2/10 | 0/8 | 56/128 | 11/128 |
-
-测试与 OOD 合计为**每个模型 548 个案例**，全部评测轨迹均通过独立模拟器重放。上方大规模导航演示使用页面标明的局部问题与代码规划设置。
-
-[完整测试及 OOD 结果](docs/SONIC_PREDICT_POSITION_RESULTS.md) · [训练流程](docs/SONIC_PREDICT_POSITION.md)
-
-## 数据规模与模型
-
-**每种目标版本包含 18,760 条决策问题，其中 16,333 条来自 ViZDoom。** hard-target 与 soft-target 两种版本覆盖相同问题，均划分为 train、dev、calibration、test 和 OOD 五个分区。
-
-| 任务 | 五个分区合计 | 训练分区 |
-|---|---:|---:|
-| **ViZDoom Predict Position** | **11,173** | **6,788** |
-| **ViZDoom Basic** | **5,160** | **3,054** |
-| Maze | 1,469 | 653 |
-| Snake | 958 | 403 |
-| **每种版本合计** | **18,760** | **10,898** |
-
-**专家游戏轨迹：** 数据包包含 **896 局 Predict Position、17,498 个决策步骤**，其中 512 局分配给训练。还包括原始混合任务输入、hard/soft 目标、评测轨迹和重放检查记录。
-
-训练分区保存的 10,898 条问题中，**10,893 条**通过目标有效性检查。原有 Maze、Snake 和 Basic 分区保持一致。
-
-### 发布版本与训练实验
-
-**`unified-games-v1` 打包的是 `hard_lr1e5` 训练实验的第 400 步 checkpoint。** 两个名称对应同一份选定模型，四款演示均使用该模型。
-
-| 名称 | 含义 | 使用场景 |
-|---|---|---|
-| **`unified-games-v1`** | Hugging Face 发布标签，固定对应的模型与数据快照。 | 下载时填写 `revision="unified-games-v1"`。 |
-| **`hard_lr1e5`** | 训练实验名：Predict Position 使用 one-hot 硬动作目标，backbone 学习率为 `1e-5`，决策头学习率为 `1e-4`。 | 查看训练配置、日志与实验对比。 |
-
-共享模型使用完整问题交叉熵训练。每次更新按 **1/3、1/3、1/6、1/6** 的权重混合 Maze、Snake、Basic 和 Predict Position。
-
-**Hugging Face 发布完成：** 模型与完整数据均已上传并通过校验，版本为 `unified-games-v1`。两个发布标签均固定到对应快照，所有上传文件均通过远端内容校验。
-
-模型与数据集均为公开版本，无需登录即可下载。
+`scripts/pp_tree.py` 让这件事在计算上可行：每次决策只对状态和问题编码一次，各候选项共享这段前缀，每次决策约 530 个 token，而不是约 1,950 个，输出不变（可用 `pp_rl.py check-forward` 验证）。
 
 ## 快速开始
 
-```bash
-git clone https://github.com/TianyuCodings/NanoJev.git
-cd NanoJev
-python -m pip install -r requirements-toy.txt huggingface_hub
-```
-
-下载当前 checkpoint 与数据：
-
-```python
-from huggingface_hub import snapshot_download
-
-snapshot_download(
-    repo_id="C-Tianyu/NanoJev",
-    revision="unified-games-v1",
-    local_dir="checkpoints/NanoJev-unified",
-    allow_patterns=["best.safetensors", "config.json", "tokenizer/*", "backbone_config/*"],
-)
-snapshot_download(
-    repo_id="C-Tianyu/NanoJev-Data",
-    repo_type="dataset",
-    revision="unified-games-v1",
-    local_dir="data/NanoJev-unified",
-)
-```
-
-在 CUDA 环境启动推理服务：
+需要一块 CUDA GPU（上面的实验用了一块 A100 40 GB），以及运行 ViZDoom 的 CPU 核心。
 
 ```bash
-python scripts/serve_decisions.py \
-  --checkpoint-dir checkpoints/NanoJev-unified \
-  --web-root web --port 8765 --disable-native-triton
+git clone https://github.com/Hajime-Y/nanojev-grpo && cd nanojev-grpo
+bash scripts/pp_setup.sh        # .venv、固定版本的依赖、从 Hugging Face 下载 NanoJev 的权重和数据集
+source .venv/bin/activate
 ```
 
-模型只加载一次。向 **`POST http://127.0.0.1:8765/api/evaluate`** 发送状态与问题批次即可调用。
-
-本地体验真实游戏回放：
+评估已发布的权重（应得到 27/128）：
 
 ```bash
-python3 -m http.server 8080 --bind 127.0.0.1 --directory web
+python scripts/pp_rl.py eval --checkpoint checkpoints/NanoJev-unified \
+  --cases configs/sonic_predict_supervision_v1_cases.jsonl --splits test --mode greedy \
+  --workers 24 --output runs_pp/base_test_greedy.jsonl
 ```
 
-打开 **http://127.0.0.1:8080/dev/?autoplay=1** 体验 ViZDoom Basic，或打开 **http://127.0.0.1:8080/dev/side-by-side.html?autoplay=1#maze** 体验迷宫。
+从已发布权重做 GRPO，以及作为对照的 SFT：
 
-## 开发文档
+```bash
+scripts/pp_train.sh grpo_main grpo --steps 50 --tasks-per-step 16 --group-size 16 --minibatches 8 \
+  --clip 0.2 --temperature 1.0 --backbone-lr 1e-5 --head-lr 1e-4 --eval-every 5 --save-every 10 --workers 24
 
-[发布内容与复现方法](docs/UNIFIED_DEVELOPMENT_RELEASE.md) · [输入契约](docs/TYPESAFE_CONTRACT.md) · [统一环境](docs/UNIFIED_GAMES.md) · [原子判断与规划](docs/ATOMIC_PLANNING.md) · [Predict Position 回放](docs/PREDICT_POSITION_DEMO.md) · [射击回放](docs/SHOOTING_DEMO.md)
+scripts/pp_train.sh sft_main sft --updates 1200 --batch-questions 64 --backbone-lr 1e-5 --head-lr 1e-4 \
+  --eval-every 100 --save-every 100 --workers 24
+```
 
-## 路线图
+从最好的 SFT 快照（`python scripts/pp_pick_best.py runs_pp/sft_main/eval.jsonl update` 会给出它的名字）出发，在新种子上继续做 GRPO：
 
-- [x] 一个统一 checkpoint 支持 Maze、Snake 和两款射击任务。
-- [x] 50×50 迷宫、长局 Snake 与三模型同步网页回放。
-- [x] 混合任务 SFT、可复现的数据划分与独立重放评测。
-- [ ] 面向更多长程任务的 RLCD 后训练。
-- [ ] 共享前缀推理与更大的候选批次。
-- [ ] 更多射击场景与结构化输入支持。
+```bash
+INIT=runs_pp/sft_main/ckpt/update-1100 CASES=configs/pp_fresh1600_cases.jsonl \
+scripts/pp_train.sh grpo_from_sft grpo --steps 50 --tasks-per-step 32 --group-size 16 --minibatches 2 \
+  --clip 0.2 --temperature 1.0 --backbone-lr 3e-6 --head-lr 3e-5 --eval-every 5 --save-every 10 \
+  --workers 16 --max-microbatch-tokens 17000 --max-forward-tokens 70000
+```
+
+表中的评估、逐回合的配对比较，以及回放视频：
+
+```bash
+scripts/pp_final_eval.sh sft  runs_pp/sft_main/ckpt/update-1100
+scripts/pp_final_eval.sh grpo runs_pp/grpo_main/ckpt/step-0050
+python scripts/pp_compare.py --a runs_pp/final/sft_test_greedy.jsonl  runs_pp/final/sft_heldout_greedy.jsonl \
+                             --b runs_pp/final/grpo_test_greedy.jsonl runs_pp/final/grpo_heldout_greedy.jsonl
+python scripts/pp_other_games.py --checkpoint runs_pp/grpo_main/ckpt/step-0050 --output runs_pp/other/grpo.json
+
+pip install pillow
+python scripts/pp_video.py --seed 9300761 --output pp_train.gif \
+  --panel "SFT=runs_pp/final/sft_test_greedy.jsonl" --panel "GRPO=runs_pp/final/grpo_test_greedy.jsonl"
+```
+
+有两项测量不需要模型，只用 CPU 就能跑：`python scripts/pp_probe.py play --engine random ...` 和 `--engine oracle --annotate lookahead ...`（只用代码的规则）。`--engine jev` 会把请求发给本地的中转服务（`scripts/pp_jev_relay.py`，它从 macOS 钥匙串读取密钥并转发到 OpenRouter）。Snake 的问题由 `scripts/pp_snake_probe.py` 生成并提问。
+
+测试：
+
+```bash
+cd scripts && python -m unittest test_pp_rl test_pp_probe test_pp_snake_probe \
+  test_unified_pipeline test_unified_doom_env test_unified_grid_envs test_composed_maze test_question_contract
+```
+
+## 仓库里有什么
+
+| 路径 | 来源 | 用途 |
+|---|---|---|
+| `scripts/pp_rl.py`、`pp_envpool.py`、`pp_tree.py` | 新增 | GRPO、对照用的 SFT、批量评估、共享前缀的前向计算 |
+| `scripts/pp_probe.py`、`pp_snake_probe.py`、`pp_jev_relay.py` | 新增 | 探针测量、带结果标注的游玩、Jev / 只用代码 / 随机三种引擎、Snake 问题 |
+| `scripts/pp_*.sh`、`pp_compare.py`、`pp_pick_best.py`、`pp_probe_auc.py`、`pp_other_games.py`、`pp_video.py` | 新增 | 环境搭建、可续跑的训练、表中的评估、分析、回放视频 |
+| `configs/pp_*_cases.jsonl` | 新增 | 上面数字所用的留出种子、探针种子和新的训练种子 |
+| `scripts/train_toy_decisions.py`、`predict_toy_decisions.py` | NanoJev | 决策模型及其加载器 |
+| `scripts/unified_*.py`、`snake_game.py`、`scaled_maze.py`、`evaluate_*.py` | NanoJev | 环境、请求格式和 rollout 流程 |
+| `configs/sonic_predict_supervision_v1_cases.jsonl`、`configs/appo_basic_supervision_v1_cases.jsonl` | NanoJev | 已发布的训练 / 开发 / 测试 / OOD 种子 |
+
+NanoJev 的浏览器演示、研究日志、结果文件、数据构建脚本和其他实验在这里用不到，已通过普通提交删除。它们都保留在 [NanoJev 的 `76fdfc9`](https://github.com/TianyuCodings/NanoJev/tree/76fdfc9)；模型本身、它的训练流程和文档也请到那里查看。本实验训练出的权重没有发布。
+
+## 许可与致谢
+
+与 NanoJev 相同，采用 MIT 许可；见 [`LICENSE`](LICENSE)，其中保留了原始的版权声明。
+
+- TianyuCodings 的 [NanoJev](https://github.com/TianyuCodings/NanoJev)：模型、已发布的[权重](https://huggingface.co/C-Tianyu/NanoJev)和[数据集](https://huggingface.co/datasets/C-Tianyu/NanoJev-Data)、环境。
+- 游戏来自 [ViZDoom](https://github.com/Farama-Foundation/ViZDoom)；SFT 对照所用的 NanoJev 数据集中的专家动作由 [Sonic Doom](https://github.com/thainv0212/sonic_doom) 的策略产生。
+- GRPO 出自 [DeepSeekMath](https://arxiv.org/abs/2402.03300)。
+- TypeSafe 的 [Jev](https://typesafe.ai/blog/introducing-system-one-models-and-jev) 是探针中测量的托管决策模型。

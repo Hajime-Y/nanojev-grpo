@@ -22,3 +22,7 @@ publish/
 *.pt
 *.pth
 .DS_Store
+
+# Outputs of the Predict Position runs
+runs_pp/
+runs_pp_local/

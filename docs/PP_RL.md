@@ -1,5 +1,8 @@
 # Predict Position: GRPO and SFT control
 
+Reference for `scripts/pp_rl.py` and the probes. The overview, results and the commands of the reported runs are in the
+[README](../README.md); `scripts/pp_setup.sh` installs the requirements and downloads the checkpoint and dataset used below.
+
 Run from the repository root on one CUDA GPU. Uses only local checkpoints and
 the existing torch, transformers, safetensors and ViZDoom installation; no downloads.
 `eval` batches live policy decisions across CPU environments. `grpo` learns from
@@ -35,18 +38,18 @@ python scripts/pp_rl.py cases --output /tmp/pp-heldout.jsonl --count 512 \
   --seed-start 9400000 --split heldout \
   --exclude configs/sonic_predict_supervision_v1_cases.jsonl
 
-python scripts/pp_rl.py eval --checkpoint /models/released \
+python scripts/pp_rl.py eval --checkpoint checkpoints/NanoJev-unified \
   --cases configs/sonic_predict_supervision_v1_cases.jsonl --splits test \
   --mode greedy --workers 28 --output runs/pp-test.jsonl
 
-python scripts/pp_rl.py check-forward --checkpoint /models/released \
+python scripts/pp_rl.py check-forward --checkpoint checkpoints/NanoJev-unified \
   --data data/NanoJev-unified/unified/hard --count 64 --precision bf16
 
-python scripts/pp_rl.py grpo --init-checkpoint /models/released \
+python scripts/pp_rl.py grpo --init-checkpoint checkpoints/NanoJev-unified \
   --cases configs/sonic_predict_supervision_v1_cases.jsonl --output-dir runs/pp-grpo \
   --steps 50 --tasks-per-step 16 --group-size 16 --minibatches 8 --workers 28
 
-python scripts/pp_rl.py sft --init-checkpoint /models/released \
+python scripts/pp_rl.py sft --init-checkpoint checkpoints/NanoJev-unified \
   --data data/NanoJev-unified/unified/hard \
   --cases configs/sonic_predict_supervision_v1_cases.jsonl --output-dir runs/pp-sft \
   --updates 2400 --batch-questions 64 --eval-every 200 --save-every 200 --workers 28
@@ -133,10 +136,10 @@ that a model predicts consequences independently of the supplied simulation.
 
 ```bash
 # Baseline policy and the same policy with code-written consequences.
-python scripts/pp_probe.py play --engine checkpoint --checkpoint /models/released \
+python scripts/pp_probe.py play --engine checkpoint --checkpoint checkpoints/NanoJev-unified \
   --cases /tmp/pp-heldout.jsonl --splits heldout --mode greedy \
   --annotate none --workers 28 --max-concurrent 128 --output runs/pp-plain.jsonl
-python scripts/pp_probe.py play --engine checkpoint --checkpoint /models/released \
+python scripts/pp_probe.py play --engine checkpoint --checkpoint checkpoints/NanoJev-unified \
   --cases /tmp/pp-heldout.jsonl --splits heldout --mode greedy \
   --annotate lookahead --workers 28 --output runs/pp-lookahead.jsonl
 
@@ -146,12 +149,12 @@ python scripts/pp_probe.py play --engine oracle --annotate lookahead \
   --cases /tmp/pp-heldout.jsonl --splits heldout --output runs/pp-oracle.jsonl
 
 # Collect states under policies that never choose shoot.
-python scripts/pp_probe.py build --checkpoint /models/released \
+python scripts/pp_probe.py build --checkpoint checkpoints/NanoJev-unified \
   --cases /tmp/pp-probe-cases.jsonl --splits probe \
   --behaviors policy_noshoot,random_noshoot --stride 3 --seed 17 \
   --output runs/pp-probe.jsonl
 
-python scripts/pp_probe.py score --engine checkpoint --checkpoint /models/released \
+python scripts/pp_probe.py score --engine checkpoint --checkpoint checkpoints/NanoJev-unified \
   --probe runs/pp-probe.jsonl --questions policy,boolean --output runs/pp-local-scores.jsonl
 python scripts/pp_probe.py score --engine jev \
   --jev-url http://127.0.0.1:8791/v1/systemone --jev-model typesafe/jev-1.13 \

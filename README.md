@@ -1,153 +1,154 @@
-# NanoJev — A nano replica of [Jev](https://typesafe.ai/blog/introducing-system-one-models-and-jev)
+# NanoJev-GRPO — GRPO post-training for NanoJev decision models
 
-**English** | [简体中文](README.zh-CN.md)
+**English** | [简体中文](README.zh-CN.md) | [日本語](README.ja.md)
 
-**A 0.6B parallel decision model: states and questions in, complete probability distributions out. Zero output-token decoding.**
+> **This is an unofficial extension of [NanoJev](https://github.com/TianyuCodings/NanoJev) by [TianyuCodings](https://github.com/TianyuCodings).**
+> The decision model, the released checkpoint and dataset, and the game environments are NanoJev's work. This repository starts from NanoJev commit [`76fdfc9`](https://github.com/TianyuCodings/NanoJev/tree/76fdfc9) with its history kept, and adds reinforcement learning from episode outcomes (GRPO) on top of it. Many thanks to the original author. Any mistakes in the additions are mine.
 
-> **New project: [JevHarness](https://github.com/TianyuCodings/JevHarness)** — Let an LLM build task-specific decision harnesses with [Jev](https://typesafe.ai/blog/introducing-system-one-models-and-jev), with optional refinement using rewards and execution traces. Includes an interactive Pokémon demo.
+![The same ViZDoom Predict Position seed played by three checkpoints: the released weights and the SFT continuation fire at once and miss, the GRPO checkpoint waits and hits](docs/assets/pp_train.gif)
 
-[Play ViZDoom](https://nanojev-dev.tianyuchen99.chatgpt.site/?autoplay=1) · [Maze & Snake](https://nanojev-dev.tianyuchen99.chatgpt.site/side-by-side?autoplay=1#maze) · [Model](https://huggingface.co/C-Tianyu/NanoJev) · [Dataset](https://huggingface.co/datasets/C-Tianyu/NanoJev-Data)
+*One seed, three checkpoints, replayed from recorded actions. The released NanoJev weights and their SFT continuation fire at once and miss; the GRPO checkpoint waits and hits. On the 128 test episodes SFT misses and GRPO hits in 36, and the reverse happens in 11; this clip is one of the 36. The yellow marker is drawn by the replay tool.*
 
-**Now playing ViZDoom:** one shared checkpoint handles Basic aiming and Predict Position's moving-target rocket shots, alongside Maze and Snake.
+## What this repository shows
 
-**4 tasks · 18,760 decision questions per data variant · 896 Predict Position expert episodes**
+A decision model returns a probability for each candidate in one forward pass and generates no text. That makes it fast, and it also means it has nowhere to think about what a choice will lead to. Public game demos get around this by letting code simulate every option and write the outcome into the input.
 
-## What's new
+This repository tests the other route: put the look-ahead into the weights. It trains NanoJev (Qwen3-0.6B with decision heads) on ViZDoom Predict Position with **GRPO over whole episodes**: no expert labels, no simulated outcomes in the input, only whether the episode ended in a kill.
 
-**September 20, 2026 — One model, four games.**
+| Checkpoint | Expert labels | Success on 640 episodes, greedy / sampled | 8 ticks per decision (128) | ViZDoom Basic (128) |
+|---|---|---:|---:|---:|
+| Released NanoJev weights | — | 19.4% / 18.0% | 14 | 128 |
+| SFT on the expert's actions | yes | 68.6% / 66.1% | 57 | 128 |
+| **GRPO from the released weights** | **no** | **79.1% / 77.2%** | 34 | 107 |
+| GRPO continued from the SFT plateau | SFT part only | 81.4% / 80.8% | 69 | 128 |
 
-- **ViZDoom Basic:** **128/128** test successes, compared with **56/128** for [Jev](https://typesafe.ai/blog/introducing-system-one-models-and-jev).
-- **ViZDoom Predict Position:** **27/128** test successes, up from **11/128** before this round; the matched [Jev](https://typesafe.ai/blog/introducing-system-one-models-and-jev) run also scores **11/128**. The policy learns when to turn, wait and fire at a moving target.
-- **16,333 ViZDoom questions** within an **18,760-question** mixed-task dataset per target variant, spanning train, dev, calibration, test and OOD.
-- **One model, four games:** the same step-400 checkpoint also completes the 50×50 maze in **225 attempts** and collects **30 food items** during a full 256-step Snake run.
+- The 640 episodes are the released test split (128) plus 512 held-out seeds; none are used in training.
+- SFT and GRPO start from the same weights and use the same 512 training seeds. On the 640 episodes SFT alone succeeds in 72, GRPO alone in 139 (exact sign test, p < 0.00001).
+- SFT plateaus after about 400 updates; 800 more do not help. GRPO passes that level without labels, and GRPO started from the SFT plateau climbs further.
 
-## Three models, side by side
+![Success on 512 held-out seeds during training: SFT plateaus at 65 to 69 percent, GRPO alone ends at 77 percent, GRPO from the SFT plateau ends at 81 percent](docs/assets/curves.png)
 
-Real browser replays of **[Jev](https://typesafe.ai/blog/introducing-system-one-models-and-jev), NanoJev and Untuned Qwen**. These animations loop automatically; click either one to open its interactive player. All four demos use the same current NanoJev checkpoint. The interactive development site currently requires access; all recordings can also be played locally using the commands below.
+### Known weaknesses
 
-### ViZDoom Basic · Aim, then fire
+- **It learns a way of playing that fits the training condition.** The GRPO policy waits and then shoots. With 8 ticks per decision instead of 4 it never fires in 75 of 128 episodes (when it does fire it hits 64% of the time, against 45% for SFT), and on ViZDoom Basic all 21 failures are timeouts.
+- **Success went up; the look-ahead itself is not shown to be better than SFT's.** How well p(shoot) separates states where a shot hits from states where it misses (AUC, monster visible and time left): 0.64 before training, 0.80 after SFT, 0.76 after GRPO.
+- **Greedy play collapsed for a while** around step 20 of the GRPO run; sampled play did not.
+- **The last row is not a controlled comparison with the GRPO row.** It uses 1,600 fresh seeds, 32 seeds per step, 2 updates per step and a third of the learning rate.
+- **Small scale:** one training run per row, one game, a 0.6B model.
 
-[![NanoJev eliminates the target with one shot while Jev and Untuned Qwen fail, shown side by side on the same game clock](assets/basic_unified_autoplay.gif)](https://nanojev-dev.tianyuchen99.chatgpt.site/?autoplay=1)
+## Why: the model reads, it does not look ahead
 
-Move into position, line up the target, fire. NanoJev eliminates the target with **one shot in 1.40 s**; [Jev](https://typesafe.ai/blog/introducing-system-one-models-and-jev) and Untuned Qwen each fire **19 shots** without an elimination before the deadline. The three panels share the same game clock and show original frames and action probabilities.
+The same repository measures the hosted Jev model (`typesafe/jev-1.13`) on the same task.
 
-### Find the exit · 50×50 Maze
+![The same seed played by Jev twice: with the input as is it keeps choosing shoot and times out, with code-written outcomes in the candidates it hits](docs/assets/pp_jev.gif)
 
-[![Jev, current NanoJev and Untuned Qwen explore the same 50×50 maze in the live three-panel viewer](assets/maze_unified_autoplay.gif)](https://nanojev-dev.tianyuchen99.chatgpt.site/side-by-side?autoplay=1#maze)
+| Who chooses | What the candidates say | Success (128 test episodes) |
+|---|---|---:|
+| Uniform random | — | 12 |
+| Jev | Original text, e.g. `Hold attack for 4 Doom ticks.` | 0 |
+| Jev | Original text + the outcome simulated by code | 112 |
+| Jev | Same, plus an instruction that explains the annotation | 126 |
+| Code only: pick the option whose text says it kills | — | 126 |
 
-NanoJev reaches the exit in **225 attempts**, versus **2,738** for [Jev](https://typesafe.ai/blog/introducing-system-one-models-and-jev) and **4,726** for Untuned Qwen. Each system combines local safety probabilities with the same exploration code and remembered open paths.
+- The 126 episodes Jev wins with annotations are exactly the 126 that the code-only rule wins.
+- Jev answers explicit questions about the state (is the monster right of the screen centre?) 97.7% of the time. Its p(shoot) does not separate hits from misses (AUC 0.49).
+- On Snake, where every rule is known, Jev is 100% on a lookup question, 63.5% on applying the rule one move ahead and 70.0% five moves ahead. Chat LLMs that reason before answering reach 98–100% and 72–99%; the same LLMs answering in one word drop to 39.5–50.5% on the five-move question. The gap comes from being able to think before answering.
 
-[Play Snake](https://nanojev-dev.tianyuchen99.chatgpt.site/side-by-side?autoplay=1#snake) · [Play Predict Position](https://nanojev-dev.tianyuchen99.chatgpt.site/predict-position?autoplay=1)
+## How GRPO is applied to a decision model
 
-## What NanoJev does
+![One seed is played 16 times, each episode gets a group-relative advantage from its outcome, and every decision of the episode is updated with it](docs/assets/grpo.png)
 
-- **Parallel decisions:** batch independent states, questions and candidate paths in one backbone forward.
-- **Dynamic candidates:** Choice returns a distribution over 2–255 supplied candidates using a shared scoring head.
-- **Boolean and ordered scores:** predict a proposition's probability, or a distribution and expectation over 2–10 ordered levels.
-- **Direct probabilities:** rank, select or sample actions without generating answer tokens.
-- **One small backbone:** Qwen3-0.6B with decision heads, reused across all four game tasks and a persistent inference service.
+It is the GRPO used for LLMs with two substitutions: one action is a choice among the candidates instead of a token, and one trajectory is an episode (20 to 30 decisions) instead of one answer.
 
-Each request supplies a **state**, a **question** and its **candidates**. The backbone encodes candidate paths; shared heads produce the requested probabilities. Choice uses set attention and a softmax, Boolean uses a sigmoid, and Score returns a probability-weighted level.
+```text
+A_i     = (r_i - mean(r)) / std(r)                      r_i in {0, 1}, over the 16 episodes of one seed
+rho_i,t = pi_theta(a_i,t | s_i,t) / pi_old(a_i,t | s_i,t)
+L       = - mean over decisions of  min(rho_i,t * A_i, clip(rho_i,t, 1 - eps, 1 + eps) * A_i),   eps = 0.2
+```
 
-## Held-out gameplay
+Groups whose 16 outcomes are all equal carry no signal and are dropped. There is no critic, no KL term and no reference model. The two functions are `group_advantages` and `clipped_loss` in [`scripts/pp_rl.py`](scripts/pp_rl.py); the full description is in [`docs/PP_RL.md`](docs/PP_RL.md).
 
-Successful episodes on the complete **274-case test set**, using the same observation interface, candidate actions and seeded epsilon-greedy controller across systems:
-
-| Model | Maze | Snake | Basic | Predict Position |
-|---|---:|---:|---:|---:|
-| **NanoJev** | **4/10** | **8/8** | **128/128** | **27/128** |
-| [Jev](https://typesafe.ai/blog/introducing-system-one-models-and-jev) | 7/10 | 8/8 | 56/128 | 11/128 |
-| Untuned Qwen3-0.6B | 2/10 | 0/8 | 56/128 | 11/128 |
-
-Test and OOD together contain **548 cases per model**. Every evaluated trajectory passes independent simulator replay. The large navigation showcases above use their displayed local-question and code-planning settings.
-
-[Complete test and OOD results](docs/SONIC_PREDICT_POSITION_RESULTS.md) · [Training pipeline](docs/SONIC_PREDICT_POSITION.md)
-
-## Dataset scale and model
-
-**18,760 decision questions per target variant, including 16,333 ViZDoom questions.** The matched hard-target and soft-target variants cover the same questions across train, dev, calibration, test and OOD.
-
-| Task | All five splits | Training split |
-|---|---:|---:|
-| **ViZDoom Predict Position** | **11,173** | **6,788** |
-| **ViZDoom Basic** | **5,160** | **3,054** |
-| Maze | 1,469 | 653 |
-| Snake | 958 | 403 |
-| **Total per variant** | **18,760** | **10,898** |
-
-**Expert gameplay:** the package includes **896 Predict Position episodes with 17,498 recorded decisions**, including 512 episodes assigned to training. It also contains the original mixed-task inputs, hard/soft targets, evaluation trajectories and replay checks.
-
-Of the 10,898 stored training questions, **10,893** pass the target-validity filter. Existing Maze, Snake and Basic splits are preserved.
-
-### Release version and training run
-
-**`unified-games-v1` packages the step-400 checkpoint from the `hard_lr1e5` training run.** Both names refer to the same selected model used across the four demos.
-
-| Name | Meaning | When to use it |
-|---|---|---|
-| **`unified-games-v1`** | Hugging Face release tag identifying the matching model and dataset snapshots. | Download with `revision="unified-games-v1"`. |
-| **`hard_lr1e5`** | Training experiment: hard (one-hot) action targets for Predict Position, backbone learning rate `1e-5`, decision-head learning rate `1e-4`. | Inspect training configs, logs and experiment comparisons. |
-
-The shared model is trained with complete-question cross entropy. Updates mix Maze, Snake, Basic and Predict Position with weights **1/3, 1/3, 1/6, 1/6**.
-
-**Hugging Face release complete:** the model and complete dataset are uploaded and verified as `unified-games-v1`. Both release tags resolve to their recorded snapshots; every uploaded file passes remote identity checks.
-
-The model and dataset are public and can be downloaded without signing in.
+`scripts/pp_tree.py` makes this affordable: the state and question are encoded once per decision and the candidates share that prefix, about 530 tokens per decision instead of about 1,950, with the same outputs (`pp_rl.py check-forward`).
 
 ## Quick start
 
-```bash
-git clone https://github.com/TianyuCodings/NanoJev.git
-cd NanoJev
-python -m pip install -r requirements-toy.txt huggingface_hub
-```
-
-Download the current checkpoint and data:
-
-```python
-from huggingface_hub import snapshot_download
-
-snapshot_download(
-    repo_id="C-Tianyu/NanoJev",
-    revision="unified-games-v1",
-    local_dir="checkpoints/NanoJev-unified",
-    allow_patterns=["best.safetensors", "config.json", "tokenizer/*", "backbone_config/*"],
-)
-snapshot_download(
-    repo_id="C-Tianyu/NanoJev-Data",
-    repo_type="dataset",
-    revision="unified-games-v1",
-    local_dir="data/NanoJev-unified",
-)
-```
-
-Start inference in a CUDA environment:
+One CUDA GPU is required (the runs above used one A100 40 GB) and CPU cores for the ViZDoom workers.
 
 ```bash
-python scripts/serve_decisions.py \
-  --checkpoint-dir checkpoints/NanoJev-unified \
-  --web-root web --port 8765 --disable-native-triton
+git clone https://github.com/Hajime-Y/nanojev-grpo && cd nanojev-grpo
+bash scripts/pp_setup.sh        # .venv, pinned requirements, NanoJev checkpoint and dataset from Hugging Face
+source .venv/bin/activate
 ```
 
-The service loads the model once. Send state/question batches to **`POST http://127.0.0.1:8765/api/evaluate`**.
-
-To explore the recorded games locally:
+Evaluate the released weights (expect 27/128):
 
 ```bash
-python3 -m http.server 8080 --bind 127.0.0.1 --directory web
+python scripts/pp_rl.py eval --checkpoint checkpoints/NanoJev-unified \
+  --cases configs/sonic_predict_supervision_v1_cases.jsonl --splits test --mode greedy \
+  --workers 24 --output runs_pp/base_test_greedy.jsonl
 ```
 
-Open **http://127.0.0.1:8080/dev/?autoplay=1** for ViZDoom Basic or **http://127.0.0.1:8080/dev/side-by-side.html?autoplay=1#maze** for Maze.
+GRPO from the released weights, and the SFT control:
 
-## Development notes
+```bash
+scripts/pp_train.sh grpo_main grpo --steps 50 --tasks-per-step 16 --group-size 16 --minibatches 8 \
+  --clip 0.2 --temperature 1.0 --backbone-lr 1e-5 --head-lr 1e-4 --eval-every 5 --save-every 10 --workers 24
 
-[Release contents and reproduction](docs/UNIFIED_DEVELOPMENT_RELEASE.md) · [Input contract](docs/TYPESAFE_CONTRACT.md) · [Unified environments](docs/UNIFIED_GAMES.md) · [Atomic planning](docs/ATOMIC_PLANNING.md) · [Predict Position replay](docs/PREDICT_POSITION_DEMO.md) · [Shooting replay](docs/SHOOTING_DEMO.md)
+scripts/pp_train.sh sft_main sft --updates 1200 --batch-questions 64 --backbone-lr 1e-5 --head-lr 1e-4 \
+  --eval-every 100 --save-every 100 --workers 24
+```
 
-## Roadmap
+GRPO continued from the best SFT snapshot (`python scripts/pp_pick_best.py runs_pp/sft_main/eval.jsonl update` names it), on fresh seeds:
 
-- [x] One unified checkpoint for Maze, Snake and both shooting tasks.
-- [x] 50×50 Maze, long Snake games and synchronized three-model browser replays.
-- [x] Mixed-task SFT, reproducible data splits and independently replayed evaluation.
-- [ ] RLCD post-training for broader long-horizon tasks.
-- [ ] Shared-prefix inference and larger candidate batches.
-- [ ] Broader shooting scenarios and structured input support.
+```bash
+INIT=runs_pp/sft_main/ckpt/update-1100 CASES=configs/pp_fresh1600_cases.jsonl \
+scripts/pp_train.sh grpo_from_sft grpo --steps 50 --tasks-per-step 32 --group-size 16 --minibatches 2 \
+  --clip 0.2 --temperature 1.0 --backbone-lr 3e-6 --head-lr 3e-5 --eval-every 5 --save-every 10 \
+  --workers 16 --max-microbatch-tokens 17000 --max-forward-tokens 70000
+```
+
+The evaluation in the table, a paired comparison, and a replay video:
+
+```bash
+scripts/pp_final_eval.sh sft  runs_pp/sft_main/ckpt/update-1100
+scripts/pp_final_eval.sh grpo runs_pp/grpo_main/ckpt/step-0050
+python scripts/pp_compare.py --a runs_pp/final/sft_test_greedy.jsonl  runs_pp/final/sft_heldout_greedy.jsonl \
+                             --b runs_pp/final/grpo_test_greedy.jsonl runs_pp/final/grpo_heldout_greedy.jsonl
+python scripts/pp_other_games.py --checkpoint runs_pp/grpo_main/ckpt/step-0050 --output runs_pp/other/grpo.json
+
+pip install pillow
+python scripts/pp_video.py --seed 9300761 --output pp_train.gif \
+  --panel "SFT=runs_pp/final/sft_test_greedy.jsonl" --panel "GRPO=runs_pp/final/grpo_test_greedy.jsonl"
+```
+
+Two probes run on CPU without a model: `python scripts/pp_probe.py play --engine random ...` and `--engine oracle --annotate lookahead ...` (the code-only rule). `--engine jev` sends requests to a local relay (`scripts/pp_jev_relay.py`, which forwards to OpenRouter with a key read from the macOS Keychain). `scripts/pp_snake_probe.py` builds and asks the Snake questions.
+
+Tests:
+
+```bash
+cd scripts && python -m unittest test_pp_rl test_pp_probe test_pp_snake_probe \
+  test_unified_pipeline test_unified_doom_env test_unified_grid_envs test_composed_maze test_question_contract
+```
+
+## What is in this repository
+
+| Path | Origin | Purpose |
+|---|---|---|
+| `scripts/pp_rl.py`, `pp_envpool.py`, `pp_tree.py` | added | GRPO, the SFT control, batched evaluation, the prefix-sharing forward |
+| `scripts/pp_probe.py`, `pp_snake_probe.py`, `pp_jev_relay.py` | added | Probes, outcome-annotated play, the Jev / oracle / random engines, the Snake questions |
+| `scripts/pp_*.sh`, `pp_compare.py`, `pp_pick_best.py`, `pp_probe_auc.py`, `pp_other_games.py`, `pp_video.py` | added | Setup, training with resume, the reported evaluation, analysis, replay videos |
+| `configs/pp_*_cases.jsonl` | added | The held-out, probe and fresh training seeds used for the numbers above |
+| `scripts/train_toy_decisions.py`, `predict_toy_decisions.py` | NanoJev | The decision model and its loader |
+| `scripts/unified_*.py`, `snake_game.py`, `scaled_maze.py`, `evaluate_*.py` | NanoJev | Environments, request format and rollout pipeline |
+| `configs/sonic_predict_supervision_v1_cases.jsonl`, `configs/appo_basic_supervision_v1_cases.jsonl` | NanoJev | Released train / dev / test / OOD seeds |
+
+NanoJev's browser demos, research logs, result files, data builders and other experiments were removed in ordinary commits because they are not used here. They are all in [NanoJev at `76fdfc9`](https://github.com/TianyuCodings/NanoJev/tree/76fdfc9), which is also where to go for the model itself, its training pipeline and its documentation. The trained weights of this experiment are not published.
+
+## License and acknowledgements
+
+MIT, as NanoJev; see [`LICENSE`](LICENSE), which keeps the original copyright notice.
+
+- [NanoJev](https://github.com/TianyuCodings/NanoJev) by TianyuCodings: the model, the released [checkpoint](https://huggingface.co/C-Tianyu/NanoJev) and [dataset](https://huggingface.co/datasets/C-Tianyu/NanoJev-Data), the environments.
+- [ViZDoom](https://github.com/Farama-Foundation/ViZDoom) for the game, and [Sonic Doom](https://github.com/thainv0212/sonic_doom), whose policy produced the expert actions in the NanoJev dataset used by the SFT control.
+- GRPO was introduced in [DeepSeekMath](https://arxiv.org/abs/2402.03300).
+- [Jev](https://typesafe.ai/blog/introducing-system-one-models-and-jev) by TypeSafe is the hosted decision model measured in the probes.
