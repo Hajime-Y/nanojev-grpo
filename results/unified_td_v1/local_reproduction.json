@@ -1,9 +1,0 @@
-{
-  "passed": true,
-  "experiment_sha256": "d04bab7a272fd2c7caab8b3e59147334017939e912618563651332bed6472094",
-  "all_8_training_metrics_and_all_1824_game_results_match": true,
-  "float_comparison_tolerance": 1e-12,
-  "source_report_sha256": "f60290e56672593f5b9fed977467bdf6e6e605dbbff5af76f2ed56122781af42",
-  "local_recomputed_report_sha256": "5253e5d67fe19ff690c082f0cec266d76c7cdbc8d78405a3741d1c65a4441a5a",
-  "local_weight_scope": "Local reproduction used verified metadata and episodes; full selected weight hashes were checked on the training host."
-}
